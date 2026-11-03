@@ -1,0 +1,1520 @@
+diff --git a/src/FocusApp.Contracts/FocusSyncContracts.cs b/src/FocusApp.Contracts/FocusSyncContracts.cs
+index 3afa7c6..fe88960 100644
+--- a/src/FocusApp.Contracts/FocusSyncContracts.cs
++++ b/src/FocusApp.Contracts/FocusSyncContracts.cs
+@@ -3,7 +3,8 @@ namespace FocusApp.Contracts;
+ public static class FocusSyncIpc
+ {
+     public const string Bind="cloud.sync.bind", Status="cloud.sync.status", Import="cloud.sync.import",
+-        Batch="cloud.sync.batch", Ack="cloud.sync.ack", Retry="cloud.sync.retry";
++        Batch="cloud.sync.batch", Ack="cloud.sync.ack", Retry="cloud.sync.retry",
++        Cursor="cloud.sync.cursor", Apply="cloud.sync.apply", HistoryPage="cloud.sync.history-page", Reset="cloud.sync.reset-cursor";
+ }
+ public sealed record CloudSyncBindCommand(Guid? UserId,string ApiScope);
+ public sealed record CloudSyncBinding(Guid BindingId,Guid? UserId,string ApiScope);
+@@ -11,7 +12,23 @@ public sealed record CloudSyncBindingCommand(Guid BindingId);
+ public sealed record CloudSyncImportCommand(Guid BindingId,IReadOnlyList<Guid> RecordIds);
+ public sealed record CloudSyncBatchCommand(Guid BindingId,int Limit);
+ public sealed record CloudSyncAckCommand(Guid BindingId,IReadOnlyList<CloudSyncAck> Results);
+-public sealed record CloudSyncStatus(int Pending,int Uploaded,int Blocked,int DeferredDeletes,IReadOnlyList<Guid> UnassignedRecordIds,string? LastError);
+-public sealed record CloudSyncItem(Guid OperationId,Guid RecordId,string PayloadJson);
++public sealed record CloudSyncStatus(int Pending,int Uploaded,int Blocked,int DeferredDeletes,IReadOnlyList<Guid> UnassignedRecordIds,string? LastError)
++{
++    public int Downloaded { get; init; }
++    public int DownloadConflicts { get; init; }
++    public bool HasMoreChanges { get; init; }
++    public DateTimeOffset? LastPulledAtUtc { get; init; }
++}
++public sealed record CloudSyncItem(Guid OperationId,Guid RecordId,string PayloadJson)
++{
++    public string Kind { get; init; } = "upsert";
++    public long? BaseRevision { get; init; }
++}
+ public sealed record CloudSyncBatch(IReadOnlyList<CloudSyncItem> Items);
+ public sealed record CloudSyncAck(Guid OperationId,Guid RecordId,string Status,long? ServerRevision,string? Code);
++public sealed record CloudSyncCursor(string? Cursor,long LastRevision);
++public sealed record CloudSyncChange(Guid RecordId,Guid SourceDeviceId,long ServerRevision,bool IsDeleted,string? PayloadJson);
++public sealed record CloudSyncChanges(IReadOnlyList<CloudSyncChange> Changes,string NextCursor,bool HasMore);
++public sealed record CloudSyncApplyCommand(Guid BindingId,string? ExpectedCursor,string NextCursor,bool HasMore,IReadOnlyList<CloudSyncChange> Changes);
++public sealed record CloudHistoryPageCommand(Guid Token,int Offset);
++public sealed record CloudHistoryPage(IReadOnlyList<LocalFocusSessionDto> Records,int NextOffset,int Total);
+diff --git a/src/FocusApp.Contracts/IpcOperations.cs b/src/FocusApp.Contracts/IpcOperations.cs
+index 4f72921..51618f4 100644
+--- a/src/FocusApp.Contracts/IpcOperations.cs
++++ b/src/FocusApp.Contracts/IpcOperations.cs
+@@ -221,7 +221,12 @@ public sealed record LocalDataSnapshotDto(
+     IReadOnlyList<LocalAutomaticRuleDto> AutomaticRules,
+     LocalAppSettingsDto Settings,
+     IReadOnlyList<LocalDurationPresetDto> DurationPresets,
+-    IReadOnlyList<LocalMonthlyFocusTargetDto> MonthlyFocusTargets);
++    IReadOnlyList<LocalMonthlyFocusTargetDto> MonthlyFocusTargets)
++{
++    public int FocusSyncVersion { get; init; }
++    public Guid? FocusHistoryToken { get; init; }
++    public int FocusHistoryCount { get; init; }
++}
+ 
+ public enum LocalFocusSessionStatusDto
+ {
+diff --git a/src/FocusApp.Contracts/NamedPipeIpcClient.FocusHistory.cs b/src/FocusApp.Contracts/NamedPipeIpcClient.FocusHistory.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Contracts/NamedPipeIpcClient.FocusHistory.cs
+@@ -0,0 +1,42 @@
++namespace FocusApp.Contracts;
++
++public sealed partial class NamedPipeIpcClient
++{
++    private async Task<T> CompleteHistoryResponseAsync<T>(T response,TimeSpan timeout,CancellationToken ct)
++    {
++        object? value=response;
++        value=value switch
++        {
++            LocalDataSnapshotDto state=>await ReadCompleteHistoryAsync(state,timeout,ct),
++            MutationResult result=>result with{State=await ReadCompleteHistoryAsync(result.State,timeout,ct)},
++            FocusSessionMutationResult result=>result with{State=await ReadCompleteHistoryAsync(result.State,timeout,ct)},
++            _=>value
++        };
++        return (T)value!;
++    }
++
++    private async Task<LocalDataSnapshotDto> ReadCompleteHistoryAsync(LocalDataSnapshotDto state,TimeSpan timeout,CancellationToken ct)
++    {
++        for(var attempt=0;;attempt++)
++        {
++            if(state.FocusHistoryToken is not { } token)return state;
++            try
++            {
++                var history=new List<LocalFocusSessionDto>();var ids=new HashSet<Guid>();var offset=0;
++                while(offset<state.FocusHistoryCount)
++                {
++                    var page=await SendAsync<CloudHistoryPageCommand,CloudHistoryPage>(FocusSyncIpc.HistoryPage,new(token,offset),timeout,ct);
++                    if(page.Total!=state.FocusHistoryCount||page.NextOffset!=offset+page.Records.Count||page.Records.Count==0||
++                        page.Records.Any(x=>x.Status!=LocalFocusSessionStatusDto.Completed||!ids.Add(x.SessionId)))
++                        throw new IpcProtocolException("历史分页响应无效。");
++                    history.AddRange(page.Records);offset=page.NextOffset;
++                }
++                return state with{FocusSessions=state.FocusSessions.Where(x=>x.Status!=LocalFocusSessionStatusDto.Completed).Concat(history).ToArray(),FocusHistoryToken=null};
++            }
++            catch(IpcRemoteException error)when(error.Error.Code==IpcErrorCode.BusinessRejected&&attempt<2)
++            {
++                state=await SendAsync<EmptyPayload,LocalDataSnapshotDto>(IpcOperations.GetState,new(),timeout,ct,expandHistory:false);
++            }
++        }
++    }
++}
+diff --git a/src/FocusApp.Contracts/NamedPipeIpcClient.cs b/src/FocusApp.Contracts/NamedPipeIpcClient.cs
+index 49dfb8a..c808ce1 100644
+--- a/src/FocusApp.Contracts/NamedPipeIpcClient.cs
++++ b/src/FocusApp.Contracts/NamedPipeIpcClient.cs
+@@ -4,7 +4,7 @@ using System.Security.Principal;
+ 
+ namespace FocusApp.Contracts;
+ 
+-public sealed class NamedPipeIpcClient : IAsyncDisposable
++public sealed partial class NamedPipeIpcClient : IAsyncDisposable
+ {
+     private readonly string _pipeName;
+     private readonly IpcClientRole _role;
+@@ -78,7 +78,8 @@ public sealed class NamedPipeIpcClient : IAsyncDisposable
+         TRequest request,
+         TimeSpan timeout,
+         CancellationToken cancellationToken = default,
+-        Guid? requestId = null)
++        Guid? requestId = null,
++        bool expandHistory = true)
+     {
+         ObjectDisposedException.ThrowIf(_disposed, this);
+         var pipe = _pipe;
+@@ -131,7 +132,10 @@ public sealed class NamedPipeIpcClient : IAsyncDisposable
+                 throw new IpcRemoteException(response.Error);
+             }
+ 
+-            return response.ReadPayload<TResponse>();
++            var value=response.ReadPayload<TResponse>();
++            return expandHistory&&_role==IpcClientRole.Desktop
++                ? await CompleteHistoryResponseAsync(value,timeout,cancellationToken)
++                : value;
+         }
+         catch (IOException exception)
+         {
+diff --git a/src/FocusApp.Core/FocusSyncModels.cs b/src/FocusApp.Core/FocusSyncModels.cs
+index 3e4438f..7821f44 100644
+--- a/src/FocusApp.Core/FocusSyncModels.cs
++++ b/src/FocusApp.Core/FocusSyncModels.cs
+@@ -2,9 +2,21 @@ namespace FocusApp.Core;
+ 
+ public sealed record FocusSyncBinding(Guid BindingId, Guid? UserId, string ApiScope);
+ public sealed record FocusSyncStatus(int Pending, int Uploaded, int Blocked, int DeferredDeletes,
+-    IReadOnlyList<Guid> UnassignedRecordIds, string? LastError);
+-public sealed record FocusUploadItem(Guid OperationId, Guid RecordId, string PayloadJson);
++    IReadOnlyList<Guid> UnassignedRecordIds, string? LastError)
++{
++    public int Downloaded { get; init; }
++    public int DownloadConflicts { get; init; }
++    public bool HasMoreChanges { get; init; }
++    public DateTimeOffset? LastPulledAtUtc { get; init; }
++}
++public sealed record FocusUploadItem(Guid OperationId, Guid RecordId, string PayloadJson)
++{
++    public string Kind { get; init; } = "upsert";
++    public long? BaseRevision { get; init; }
++}
+ public sealed record FocusUploadAck(Guid OperationId, Guid RecordId, string Status, long? ServerRevision, string? Code);
++public sealed record FocusDownloadState(string? Cursor, long LastRevision);
++public sealed record FocusRemoteChange(Guid RecordId, Guid SourceDeviceId, long ServerRevision, bool IsDeleted, string? PayloadJson);
+ public interface IFocusSyncStore
+ {
+     Task<FocusSyncBinding> BindFocusAccountAsync(Guid? userId, string apiScope, CancellationToken ct = default);
+@@ -13,4 +25,8 @@ public interface IFocusSyncStore
+     Task<IReadOnlyList<FocusUploadItem>> ReadFocusUploadBatchAsync(Guid bindingId, int limit, CancellationToken ct = default);
+     Task ApplyFocusUploadResultsAsync(Guid bindingId, IReadOnlyList<FocusUploadAck> results, CancellationToken ct = default);
+     Task RetryFocusUploadsAsync(Guid bindingId, CancellationToken ct = default);
++    Task<FocusDownloadState> GetFocusDownloadStateAsync(Guid bindingId, CancellationToken ct = default);
++    Task ResetFocusDownloadCursorAsync(Guid bindingId, CancellationToken ct = default);
++    Task ApplyFocusChangesAsync(Guid bindingId, string? expectedCursor, string nextCursor, bool hasMore,
++        IReadOnlyList<FocusRemoteChange> changes, CancellationToken ct = default);
+ }
+diff --git a/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+index f0083b0..e1b9f5e 100644
+--- a/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
++++ b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+@@ -9,7 +9,7 @@ using System.Text.Json;
+ 
+ namespace FocusApp.Desktop.Services.Cloud;
+ 
+-public sealed class CloudAccountClient : IAccountClient, IDeviceSessionClient, IFocusUploadClient
++public sealed class CloudAccountClient : IAccountClient, IDeviceSessionClient, IFocusUploadClient, IFocusDownloadClient
+ {
+     private readonly HttpClient http;
+     private readonly ICredentialStore store;
+@@ -202,8 +202,9 @@ public sealed class CloudAccountClient : IAccountClient, IDeviceSessionClient, I
+         {
+             var scope=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(http.BaseAddress!.AbsoluteUri)));
+             if(identity.ApiScope!=scope||State.Tokens?.User.Id!=identity.UserId)throw new CloudApiException("account_changed");
+-            var operations=items.Select(x=>new {x.OperationId,x.RecordId,kind="upsert",
+-                record=JsonSerializer.Deserialize<JsonElement>(x.PayloadJson),baseRevision=(long?)null}).ToArray();
++            if(items.Any(x=>x.Kind is not ("upsert" or "delete")))throw new ArgumentException("Unknown synchronization operation.");
++            var operations=items.Select(x=>new {x.OperationId,x.RecordId,kind=x.Kind,
++                record=x.Kind=="delete"?(JsonElement?)null:JsonSerializer.Deserialize<JsonElement>(x.PayloadJson),baseRevision=x.BaseRevision}).ToArray();
+             using var response=await SendAuthorizedAsync(HttpMethod.Post,"api/v1/sync/focus-records/push",new{operations},identity.UserId);
+             try
+             {
+@@ -218,6 +219,41 @@ public sealed class CloudAccountClient : IAccountClient, IDeviceSessionClient, I
+         }
+         finally{gate.Release();}
+     }
++    public async Task<CloudSyncChanges> PullFocusRecordsAsync(FocusUploadIdentity identity,string? cursor)
++    {
++        await gate.WaitAsync();
++        try
++        {
++            var scope=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(http.BaseAddress!.AbsoluteUri)));
++            if(identity.ApiScope!=scope||State.Tokens?.User.Id!=identity.UserId)throw new CloudApiException("account_changed");
++            for(var limit=50;;limit=Math.Max(1,limit/2))
++            {
++                var path="api/v1/sync/focus-records/changes?limit="+limit+(cursor is null?"":"&cursor="+Uri.EscapeDataString(cursor));
++                using var response=await SendAuthorizedAsync(HttpMethod.Get,path,expectedUser:identity.UserId);
++                try
++                {
++                    var page=await response.Content.ReadFromJsonAsync<DownloadResponse>()??throw new JsonException();
++                    if(page.Changes is null||page.Changes.Count>200||string.IsNullOrEmpty(page.NextCursor)||page.NextCursor.Length>2048||
++                        page.HasMore&&(page.Changes.Count==0||page.NextCursor==cursor))throw new JsonException();
++                    long previous=0;var changes=new List<CloudSyncChange>();
++                    foreach(var change in page.Changes)
++                    {
++                        if(change is null||change.RecordId==Guid.Empty||change.SourceDeviceId==Guid.Empty||change.ServerRevision<=previous||
++                            change.IsDeleted&&change.Record is not null||!change.IsDeleted&&change.Record?.ValueKind!=JsonValueKind.Object)throw new JsonException();
++                        previous=change.ServerRevision;
++                        changes.Add(new(change.RecordId,change.SourceDeviceId,change.ServerRevision,change.IsDeleted,change.Record?.GetRawText()));
++                    }
++                    var result=new CloudSyncChanges(changes,page.NextCursor,page.HasMore);
++                    if(JsonSerializer.SerializeToUtf8Bytes(result).Length<=800000)return result;
++                    if(limit==1)throw new JsonException();
++                }
++                catch(JsonException){throw new CloudApiException("invalid_sync_response");}
++            }
++        }
++        finally{gate.Release();}
++    }
++    private sealed record DownloadChange(Guid RecordId,Guid SourceDeviceId,long ServerRevision,bool IsDeleted,JsonElement? Record);
++    private sealed record DownloadResponse(IReadOnlyList<DownloadChange> Changes,string NextCursor,bool HasMore);
+     private sealed record UploadResponse(IReadOnlyList<CloudSyncAck> Results);
+ 
+     private async Task DrainLogoutsAsync()
+diff --git a/src/FocusApp.Desktop/Services/Cloud/FocusUploadCoordinator.cs b/src/FocusApp.Desktop/Services/Cloud/FocusUploadCoordinator.cs
+index ab7a7ac..dcd64b1 100644
+--- a/src/FocusApp.Desktop/Services/Cloud/FocusUploadCoordinator.cs
++++ b/src/FocusApp.Desktop/Services/Cloud/FocusUploadCoordinator.cs
+@@ -19,7 +19,7 @@ public sealed class FocusUploadCoordinator : INotifyPropertyChanged
+     private CloudSyncBinding? binding;
+     private CloudSyncStatus? snapshot;
+     private (int Generation,Guid Binding,IReadOnlyList<Guid> Ids)? importing;
+-    private string status="登录后可上传已完成的专注记录。";
++    private string status="登录后可双向同步已完成的专注记录。";
+     private bool busy;
+     public FocusUploadCoordinator(DesktopServiceConnection service,IFocusUploadClient cloud,bool startTimer=true,LocalFocusRecordRecovery? localRecovery=null)
+     {
+@@ -47,9 +47,9 @@ public sealed class FocusUploadCoordinator : INotifyPropertyChanged
+     public bool HasImportConfirmation=>importing is not null;
+     public bool CanPrepareImport=>!busy&&binding is not null&&snapshot?.UnassignedRecordIds.Count>0;
+     public string ImportQuestion=>$"确认将这 {importing?.Ids.Count??0} 条历史记录归属于 {identity?.Email} 并上传？";
+-    public string Summary=>snapshot is null ? "" : $"待上传 {snapshot.Pending} · 已确认 {snapshot.Uploaded} · 需处理 {snapshot.Blocked}";
++    public string Summary=>snapshot is null ? "" : $"待上传 {snapshot.Pending} · 已确认 {snapshot.Uploaded} · 已下载 {snapshot.Downloaded} · 需处理 {snapshot.Blocked}";
+     public string HistorySummary=>snapshot is null ? "" : $"本批未归属记录：{snapshot.UnassignedRecordIds.Count} 条（每次最多确认 200 条）";
+-    public string DeleteSummary=>snapshot?.DeferredDeletes>0 ? $"已保留 {snapshot.DeferredDeletes} 条删除标记；云端删除尚未开放。" : "";
++    public string DeleteSummary=>snapshot?.DeferredDeletes>0 ? $"待同步删除：{snapshot.DeferredDeletes} 条，其他设备将在同步后移除记录。" : "";
+     private void Changed([CallerMemberName]string? name=null)
+     {PropertyChanged?.Invoke(this,new(name));foreach(var n in new[]{nameof(Status),nameof(IsBusy),nameof(IsIdle),nameof(HasImportConfirmation),nameof(CanPrepareImport),nameof(ImportQuestion),nameof(Summary),nameof(HistorySummary),nameof(DeleteSummary)}) if(n!=name)PropertyChanged?.Invoke(this,new(n));}
+     private void PrepareImport()
+@@ -69,16 +69,15 @@ public sealed class FocusUploadCoordinator : INotifyPropertyChanged
+     }
+     public async Task TickAsync()
+     {
+-        if(!await gate.WaitAsync(0))return;busy=true;Changed();
++        if(!await gate.WaitAsync(0))return;busy=true;Changed();var version=generation;
+         try
+         {
+             if(!service.IsConnected){Status="本地服务未连接；记录将在本地保存恢复后继续上传。";return;}
+-            var version=generation;
+             var account=await cloud.GetUploadIdentityAsync();
+             var bound=await service.FocusSyncRequestAsync<CloudSyncBindCommand,CloudSyncBinding>(FocusSyncIpc.Bind,new(account?.UserId,account?.ApiScope??""));
+             if(version!=generation)return;
+             identity=account;
+-            if(account is null){service.ClearCloudBinding();binding=null;snapshot=null;Status="登录后可上传已完成的专注记录。";return;}
++            if(account is null){service.ClearCloudBinding();binding=null;snapshot=null;Status="登录后可双向同步已完成的专注记录。";return;}
+             binding=bound;service.UseCloudBinding(bound.BindingId);
+             var batch=await service.FocusSyncRequestAsync<CloudSyncBatchCommand,CloudSyncBatch>(FocusSyncIpc.Batch,new(bound.BindingId,50));
+             if(version!=generation)return;
+@@ -95,15 +94,43 @@ public sealed class FocusUploadCoordinator : INotifyPropertyChanged
+                 await service.FocusSyncRequestAsync<CloudSyncAckCommand,EmptyPayload>(FocusSyncIpc.Ack,new(bound.BindingId,results));
+             }
+             if(version!=generation)return;
++            if(cloud is IFocusDownloadClient download)
++            {
++                var reset=false;
++                for(var pageNumber=0;pageNumber<8;pageNumber++)
++                {
++                    var cursor=await service.FocusSyncRequestAsync<CloudSyncBindingCommand,CloudSyncCursor>(FocusSyncIpc.Cursor,new(bound.BindingId));
++                    CloudSyncChanges page;
++                    try{page=await download.PullFocusRecordsAsync(account,cursor.Cursor);}
++                    catch(CloudApiException error)when(error.Code=="invalid_sync_cursor"&&cursor.Cursor is not null&&!reset)
++                    {
++                        if(version!=generation)return;
++                        await service.FocusSyncRequestAsync<CloudSyncBindingCommand,EmptyPayload>(FocusSyncIpc.Reset,new(bound.BindingId));
++                        reset=true;pageNumber--;Status="游标已失效，正在重新拉取历史；本地记录和待同步操作已保留。";continue;
++                    }
++                    if(version!=generation)return;
++                    await service.FocusSyncRequestAsync<CloudSyncApplyCommand,EmptyPayload>(FocusSyncIpc.Apply,
++                        new(bound.BindingId,cursor.Cursor,page.NextCursor,page.HasMore,page.Changes));
++                    if(!page.HasMore)break;
++                }
++            }
++            if(version!=generation)return;
+             snapshot=await service.FocusSyncRequestAsync<CloudSyncBindingCommand,CloudSyncStatus>(FocusSyncIpc.Status,new(bound.BindingId));
+             Status=snapshot.Blocked>0 ? "部分记录需要处理，原记录已保留在本机，云端未被覆盖。" :
+-                snapshot.Pending>0 ? "记录已保存在本机，正在等待上传或重试。" : "当前账号已归属的记录已获云端确认。";
++                snapshot.Pending>0 ? "记录已保存在本机，正在等待上传或重试。" :
++                cloud is IFocusDownloadClient&&snapshot.HasMoreChanges ? "正在分批下载云端历史，下次同步将继续。" :
++                cloud is IFocusDownloadClient ? "当前账号的上传、下载和删除变化已同步。" : "当前账号已归属的记录已获云端确认。";
+         }
+         catch(Exception error) when(IsExpected(error)){Status="同步暂不可用，请检查网络、登录状态及本地服务版本后重试。";}
+-        finally{busy=false;Changed();gate.Release();}
++        finally
++        {
++            if(version==generation&&service.IsConnected)
++                try{await service.RefreshStateAsync();}catch(Exception error)when(IsExpected(error)){Status="本地同步状态尚未刷新，请重连后重试。";}
++            busy=false;Changed();gate.Release();
++        }
+     }
+     private async Task RunSafeAsync(Func<Task> action)
+     {try{await action();}catch(Exception error)when(IsExpected(error)){Status="操作尚未完成，请恢复连接后重试。";}}
+-    private static bool IsExpected(Exception e)=>e is IpcConnectionException or IpcRemoteException or InvalidOperationException or
++    private static bool IsExpected(Exception e)=>e is IpcConnectionException or IpcRemoteException or IpcProtocolException or InvalidOperationException or
+         HttpRequestException or TaskCanceledException or System.IO.IOException or System.UnauthorizedAccessException or System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException;
+ }
+diff --git a/src/FocusApp.Desktop/Services/Cloud/IFocusUploadClient.cs b/src/FocusApp.Desktop/Services/Cloud/IFocusUploadClient.cs
+index 5f94e66..285030c 100644
+--- a/src/FocusApp.Desktop/Services/Cloud/IFocusUploadClient.cs
++++ b/src/FocusApp.Desktop/Services/Cloud/IFocusUploadClient.cs
+@@ -9,3 +9,7 @@ public interface IFocusUploadClient
+     Task<FocusUploadIdentity?> GetUploadIdentityAsync();
+     Task<IReadOnlyList<CloudSyncAck>> PushFocusRecordsAsync(FocusUploadIdentity identity,IReadOnlyList<CloudSyncItem> items);
+ }
++public interface IFocusDownloadClient
++{
++    Task<CloudSyncChanges> PullFocusRecordsAsync(FocusUploadIdentity identity,string? cursor);
++}
+diff --git a/src/FocusApp.Desktop/Services/DesktopServiceConnection.cs b/src/FocusApp.Desktop/Services/DesktopServiceConnection.cs
+index bb9f8c6..d5ec532 100644
+--- a/src/FocusApp.Desktop/Services/DesktopServiceConnection.cs
++++ b/src/FocusApp.Desktop/Services/DesktopServiceConnection.cs
+@@ -29,8 +29,25 @@ public sealed class DesktopServiceConnection : INotifyPropertyChanged, IAsyncDis
+     private AccessControlStatusDto? _accessControlStatus;
+     private FocusRuntimeStatusDto? _focusRuntimeStatus;
+     private bool _disposed;
++    private readonly SemaphoreSlim historyRefreshGate=new(1,1);
++    private int historyRefreshRequested;
+     public Guid CloudBindingId { get; private set; }
+-    public void ClearCloudBinding() => CloudBindingId = Guid.Empty;
++    public void ClearCloudBinding()
++    {
++        CloudBindingId=Guid.Empty;
++        if(State is not null)
++        {
++            var filtered=FilterFocusHistory(State);
++            if(filtered.FocusSessions.Count!=State.FocusSessions.Count)
++            {State=filtered;StateChanged?.Invoke(this,filtered);}
++        }
++    }
++
++    private LocalDataSnapshotDto FilterFocusHistory(LocalDataSnapshotDto state) => state with
++    {
++        FocusSessions=state.FocusSessions.Where(x=>x.Status!=LocalFocusSessionStatusDto.Completed ||
++            state.FocusSyncVersion>=5 && (x.CloudBindingId==Guid.Empty || CloudBindingId!=Guid.Empty&&x.CloudBindingId==CloudBindingId)).ToArray()
++    };
+ 
+     public DesktopServiceConnection(
+         string? pipeName = null,
+@@ -516,8 +533,11 @@ public sealed class DesktopServiceConnection : INotifyPropertyChanged, IAsyncDis
+             return;
+         }
+ 
+-        State = state;
+-        StateChanged?.Invoke(this, state);
++        if(state.FocusHistoryToken is not null)
++        {Interlocked.Exchange(ref historyRefreshRequested,1);_ = RefreshPagedHistoryAsync();return;}
++
++        State = FilterFocusHistory(state);
++        StateChanged?.Invoke(this, State);
+     }
+ 
+     private void PublishAccessControlStatus(AccessControlStatusDto status)
+@@ -526,6 +546,22 @@ public sealed class DesktopServiceConnection : INotifyPropertyChanged, IAsyncDis
+         AccessControlStateChanged?.Invoke(this, status);
+     }
+ 
++    private async Task RefreshPagedHistoryAsync()
++    {
++        if(!await historyRefreshGate.WaitAsync(0))return;
++        try
++        {
++            do
++            {
++                Interlocked.Exchange(ref historyRefreshRequested,0);
++                await RefreshStateAsync(_lifetimeCancellation.Token);
++            }while(Volatile.Read(ref historyRefreshRequested)!=0&&!_lifetimeCancellation.IsCancellationRequested);
++        }
++        catch(Exception error)when(error is IpcConnectionException or IpcRemoteException or IpcProtocolException or OperationCanceledException)
++        {if(!_lifetimeCancellation.IsCancellationRequested)SetOnContext(()=>LastError=new(IpcErrorCode.PersistenceUnavailable,"完整历史尚未读取，请重连后重试。",true));}
++        finally{historyRefreshGate.Release();}
++    }
++
+     private void PublishFocusMutation(FocusSessionMutationResult result)
+     {
+         PublishState(result.State);
+diff --git a/src/FocusApp.Desktop/Views/AccountSyncModal.xaml b/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
+index 96b4a75..ecb854f 100644
+--- a/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
++++ b/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
+@@ -273,7 +273,7 @@
+                         <StackPanel x:Name="CloudSectionAnchor" Margin="0,29,0,0">
+                             <TextBlock FontSize="15" FontWeight="Medium" Text="{DynamicResource AccountSyncCloudNav}" />
+                             <TextBlock FontSize="15" FontWeight="Medium" Margin="0,12,0,0" Text="{DynamicResource AccountSyncContentTitle}" />
+-                            <TextBlock FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap" Text="仅上传已完成的专注记录及任务快照。屏蔽规则和其他设置继续保存在本机。" />
++                            <TextBlock FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap" Text="双向同步已完成的专注记录及任务快照，删除会同步到同账号的其他设备。屏蔽规则和其他设置继续保存在本机。" />
+                             <Border Margin="0,12,0,0" Padding="12" Style="{StaticResource AccountSyncCard}">
+                                 <StackPanel>
+                                     <TextBlock FontSize="13" TextWrapping="Wrap" Text="{Binding FocusUploads.Status, TargetNullValue=请登录并连接本地服务后上传}" />
+@@ -281,7 +281,7 @@
+                                     <TextBlock FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap" Text="{Binding FocusUploads.HistorySummary}" />
+                                     <TextBlock FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap" Text="{Binding FocusUploads.DeleteSummary}" />
+                                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0" IsEnabled="{Binding FocusUploads.IsIdle}">
+-                                        <Button Content="立即上传 / 重试" Padding="8,5" Command="{Binding FocusUploads.SyncNowCommand}" Style="{StaticResource AccountSyncPlainButton}" />
++                                        <Button Content="立即同步 / 重试" Padding="8,5" Command="{Binding FocusUploads.SyncNowCommand}" Style="{StaticResource AccountSyncPlainButton}" />
+                                         <Button Content="确认导入未归属历史" Margin="8,0,0,0" Padding="8,5" IsEnabled="{Binding FocusUploads.CanPrepareImport}" Command="{Binding FocusUploads.PrepareImportCommand}" Style="{StaticResource AccountSyncPlainButton}" />
+                                     </StackPanel>
+                                 </StackPanel>
+diff --git a/src/FocusApp.Infrastructure/Persistence/SqliteDatabaseInitializer.cs b/src/FocusApp.Infrastructure/Persistence/SqliteDatabaseInitializer.cs
+index 199bb8a..3239925 100644
+--- a/src/FocusApp.Infrastructure/Persistence/SqliteDatabaseInitializer.cs
++++ b/src/FocusApp.Infrastructure/Persistence/SqliteDatabaseInitializer.cs
+@@ -7,7 +7,7 @@ internal sealed class SqliteDatabaseInitializer(
+     string databasePath,
+     SqliteLocalDataStoreOptions options)
+ {
+-    public const int CurrentSchemaVersion = 15;
++    public const int CurrentSchemaVersion = 16;
+ 
+     private const string MigrationV1 = """
+         CREATE TABLE focus_sessions (
+@@ -324,6 +324,7 @@ internal sealed class SqliteDatabaseInitializer(
+             13 => "ALTER TABLE app_settings ADD COLUMN focus_character_id TEXT NOT NULL DEFAULT 'white_boy01';",
+             14 => "ALTER TABLE tasks ADD COLUMN flag_color TEXT NULL; ALTER TABLE subtasks ADD COLUMN flag_color TEXT NULL;",
+             15 => SqliteLocalDataStore.FocusSyncMigration,
++            16 => SqliteLocalDataStore.FocusDownloadMigration,
+             _ => throw new InvalidOperationException($"缺少数据库版本 {targetVersion} 的迁移。")
+         };
+ 
+diff --git a/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusDownload.cs b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusDownload.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusDownload.cs
+@@ -0,0 +1,236 @@
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.Json;
++using FocusApp.Core;
++using Microsoft.Data.Sqlite;
++
++namespace FocusApp.Infrastructure.Persistence;
++
++public sealed partial class SqliteLocalDataStore
++{
++    internal const string FocusDownloadMigration = """
++        CREATE TABLE IF NOT EXISTS focus_sync_progress(binding_id TEXT PRIMARY KEY,cursor TEXT,last_revision INTEGER NOT NULL DEFAULT 0,
++          has_more INTEGER NOT NULL DEFAULT 1,last_pull_utc TEXT,
++          FOREIGN KEY(binding_id) REFERENCES focus_sync_bindings(binding_id) ON DELETE CASCADE);
++        CREATE TABLE IF NOT EXISTS focus_sync_remote(binding_id TEXT NOT NULL,record_id TEXT NOT NULL,source_device_id TEXT NOT NULL,
++          server_revision INTEGER NOT NULL,is_deleted INTEGER NOT NULL,payload_json TEXT,target_id TEXT,
++          local_deleted INTEGER NOT NULL DEFAULT 0,conflict INTEGER NOT NULL DEFAULT 0,
++          PRIMARY KEY(binding_id,record_id),FOREIGN KEY(binding_id) REFERENCES focus_sync_bindings(binding_id) ON DELETE CASCADE);
++        CREATE INDEX IF NOT EXISTS ix_focus_sync_remote_target ON focus_sync_remote(binding_id,target_id);
++        UPDATE focus_sync_outbox SET state=0 WHERE kind='delete' AND state=4;
++        """;
++
++    private sealed record RemotePayload(int ConfiguredSeconds,int ActualSeconds,DateTimeOffset PreparationStartedAtUtc,
++        DateTimeOffset? FocusStartedAtUtc,DateTimeOffset? PlannedEndAtUtc,DateTimeOffset CompletedAtUtc,string CompletionKind,
++        bool IsForcedMode,string? TargetId,string? TargetNameSnapshot,bool BlockingEnabled,Guid? AutomaticRuleId,
++        DateTimeOffset? AutomaticOccurrenceStartedAtUtc,IReadOnlyList<LocalFocusSessionTaskSnapshot> CompletedTasks);
++
++    private static LocalFocusSession RemoteSession(Guid id,Guid binding,string json)
++    {
++        var p=JsonSerializer.Deserialize<RemotePayload>(json,SyncJson) ?? throw new LocalDataException("云端记录内容无效。");
++        if(p.ConfiguredSeconds is <1 or >86400 || p.ActualSeconds<0 || p.ActualSeconds>p.ConfiguredSeconds ||
++            p.TargetId?.Length>128 || p.TargetNameSnapshot?.Length>4096 ||
++            p.CompletedTasks is null || p.CompletedTasks.Count>200 || p.CompletedTasks.Any(x=>x is null ||
++                string.IsNullOrWhiteSpace(x.TaskId) || x.TaskId.Length>128 || x.TaskNameSnapshot is null || x.TaskNameSnapshot.Length>4096 || x.SortOrder<0 ||
++                x.Details is { } d && (d.Description is null || d.Description.Length>16384 || d.SubTasks is null || d.SubTasks.Count>200 ||
++                    d.SubTasks.Any(y=>y is null || y.Title is null || y.Title.Length>4096))) ||
++            p.CompletedTasks.Select(x=>x.TaskId).Distinct(StringComparer.Ordinal).Count()!=p.CompletedTasks.Count ||
++            p.CompletionKind is not ("natural" or "earlyEnd") || p.CompletedAtUtc<p.PreparationStartedAtUtc)
++            throw new LocalDataException("云端专注记录格式无效，游标未推进。");
++        return new(id,LocalFocusSessionStatus.Completed,p.IsForcedMode,p.ConfiguredSeconds,p.ActualSeconds,
++            p.PreparationStartedAtUtc,p.FocusStartedAtUtc,p.PlannedEndAtUtc,p.CompletedAtUtc,
++            p.CompletionKind=="natural"?FocusCompletionKind.Natural:FocusCompletionKind.EarlyEnd,
++            p.TargetId,p.TargetNameSnapshot,p.BlockingEnabled,p.AutomaticRuleId,p.AutomaticOccurrenceStartedAtUtc,p.CompletedTasks)
++        {CloudBindingId=binding};
++    }
++
++    private static async Task<FocusSyncBinding?> CurrentFocusBinding(SqliteConnection c,SqliteTransaction? t,CancellationToken ct)
++    {
++        await using var cmd=CreateCommand(c,t,"""
++            SELECT b.binding_id,b.user_id,b.api_scope FROM focus_sync_context x
++            JOIN focus_sync_bindings b ON b.binding_id=x.binding_id WHERE x.id=1
++            """);
++        await using var row=await cmd.ExecuteReaderAsync(ct);
++        return await row.ReadAsync(ct)?new(Guid.Parse(row.GetString(0)),Guid.Parse(row.GetString(1)),row.GetString(2)):null;
++    }
++
++    private static async Task<IReadOnlyList<LocalFocusSession>> ProjectFocusHistory(SqliteConnection c,
++        IReadOnlyList<LocalFocusSession> native,CancellationToken ct)
++    {
++        var binding=await CurrentFocusBinding(c,null,ct);
++        var owners=new Dictionary<Guid,(Guid Binding,bool Deleted)>();
++        await using(var cmd=CreateCommand(c,null,"""
++            SELECT o.record_id,o.user_id,b.binding_id,o.is_deleted FROM focus_sync_owners o
++            LEFT JOIN focus_sync_bindings b ON b.user_id=o.user_id AND b.api_scope=o.api_scope
++            """))
++        {
++            await using var rows=await cmd.ExecuteReaderAsync(ct);
++            while(await rows.ReadAsync(ct)) owners[Guid.Parse(rows.GetString(0))]=(
++                rows.IsDBNull(1)?Guid.Empty:rows.IsDBNull(2)?Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff"):Guid.Parse(rows.GetString(2)),rows.GetBoolean(3));
++        }
++        var visible=new Dictionary<Guid,LocalFocusSession>();
++        foreach(var session in native)
++        {
++            var owner=owners.GetValueOrDefault(session.SessionId);
++            if(session.Status!=LocalFocusSessionStatus.Completed || !owner.Deleted &&
++                (owner.Binding==Guid.Empty || binding?.BindingId==owner.Binding))
++                visible[session.SessionId]=session with{CloudBindingId=owner.Binding};
++        }
++        if(binding is not null)
++        {
++            await using var cmd=CreateCommand(c,null,"SELECT record_id,payload_json FROM focus_sync_remote WHERE binding_id=$binding AND is_deleted=0 AND local_deleted=0");
++            cmd.Parameters.AddWithValue("$binding",FormatGuid(binding.BindingId));
++            await using var rows=await cmd.ExecuteReaderAsync(ct);
++            while(await rows.ReadAsync(ct))
++            {
++                var id=Guid.Parse(rows.GetString(0));
++                if(!visible.ContainsKey(id)) visible[id]=RemoteSession(id,binding.BindingId,rows.GetString(1));
++            }
++        }
++        return visible.Values.OrderBy(x=>x.PreparationStartedAtUtc).ThenBy(x=>x.SessionId).ToArray();
++    }
++
++    public async Task<FocusDownloadState> GetFocusDownloadStateAsync(Guid bindingId,CancellationToken ct=default)
++    {
++        FocusDownloadState result=new(null,0);
++        await ExecuteWriteAsync(async(c,t)=>
++        {
++            await SyncBinding(c,t,bindingId,ct);
++            await using var cmd=CreateCommand(c,t,"SELECT cursor,last_revision FROM focus_sync_progress WHERE binding_id=$binding");
++            cmd.Parameters.AddWithValue("$binding",FormatGuid(bindingId));await using var row=await cmd.ExecuteReaderAsync(ct);
++            if(await row.ReadAsync(ct)) result=new(row.IsDBNull(0)?null:row.GetString(0),row.GetInt64(1));
++        },ct);return result;
++    }
++
++    public async Task ApplyFocusChangesAsync(Guid bindingId,string? expectedCursor,string nextCursor,bool hasMore,
++        IReadOnlyList<FocusRemoteChange> changes,CancellationToken ct=default)
++    {
++        if(string.IsNullOrEmpty(nextCursor)||nextCursor.Length>2048||changes.Count>200)
++            throw new ArgumentException("下载页面或游标无效。");
++        var sessions=new Dictionary<long,LocalFocusSession>();
++        foreach(var change in changes)
++        {
++            if(change.RecordId==Guid.Empty||change.SourceDeviceId==Guid.Empty||change.ServerRevision<=0||
++                change.IsDeleted && change.PayloadJson is not null || !change.IsDeleted && change.PayloadJson is null)
++                throw new ArgumentException("下载记录标识或内容无效。");
++            if(!change.IsDeleted)
++            {
++                if(Encoding.UTF8.GetByteCount(change.PayloadJson!)>262144)throw new ArgumentException("下载记录超过大小限制。");
++                sessions.Add(change.ServerRevision,RemoteSession(change.RecordId,bindingId,change.PayloadJson!));
++            }
++        }
++        await ExecuteWriteAsync(async(c,t)=>
++        {
++            var b=await SyncBinding(c,t,bindingId,ct);
++            if((await CurrentFocusBinding(c,t,ct))?.BindingId!=bindingId)throw new LocalDataException("同步账号已改变，下载未应用。");
++            string? cursor=null;long last=0;
++            await using(var command=CreateCommand(c,t,"SELECT cursor,last_revision FROM focus_sync_progress WHERE binding_id=$binding"))
++            {command.Parameters.AddWithValue("$binding",FormatGuid(bindingId));await using var row=await command.ExecuteReaderAsync(ct);
++             if(await row.ReadAsync(ct)){cursor=row.IsDBNull(0)?null:row.GetString(0);last=row.GetInt64(1);}}
++            if(cursor!=expectedCursor)throw new LocalDataException("下载游标已改变，请重新读取最新页面。");
++            foreach(var change in changes)
++            {
++                if(change.ServerRevision<=last)throw new LocalDataException("下载版本顺序无效，整页已回滚。");
++                last=change.ServerRevision;
++                var hash=change.IsDeleted?null:Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(RecordPayload(sessions[change.ServerRevision]))));
++                await using(var known=CreateCommand(c,t,"SELECT server_revision,is_deleted,payload_json FROM focus_sync_remote WHERE binding_id=$binding AND record_id=$id"))
++                {
++                    known.Parameters.AddWithValue("$binding",FormatGuid(bindingId));known.Parameters.AddWithValue("$id",FormatGuid(change.RecordId));
++                    await using var row=await known.ExecuteReaderAsync(ct);
++                    if(await row.ReadAsync(ct)&&row.GetInt64(0)<=change.ServerRevision)
++                    {
++                        if(row.GetBoolean(1)&&!change.IsDeleted)throw new LocalDataException("云端返回了已删除记录的复活变化，原删除标记已保留。");
++                        if(row.GetInt64(0)==change.ServerRevision && (row.GetBoolean(1)!=change.IsDeleted ||
++                            !change.IsDeleted&&Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(RecordPayload(RemoteSession(change.RecordId,bindingId,row.GetString(2))))))!=hash))
++                            throw new LocalDataException("同一云端版本的内容发生变化，整页未应用。");
++                    }
++                }
++                var localDeleted=false;var conflict=false;
++                await using(var command=CreateCommand(c,t,"SELECT payload_hash,is_deleted FROM focus_sync_owners WHERE record_id=$id AND (user_id=$user AND api_scope=$scope OR user_id IS NULL AND is_deleted=0)"))
++                {command.Parameters.AddWithValue("$id",FormatGuid(change.RecordId));command.Parameters.AddWithValue("$user",FormatGuid(b.UserId!.Value));command.Parameters.AddWithValue("$scope",b.ApiScope);
++                 await using var row=await command.ExecuteReaderAsync(ct);if(await row.ReadAsync(ct)){localDeleted=row.GetBoolean(1);conflict=!change.IsDeleted&&!localDeleted&&!row.IsDBNull(0)&&row.GetString(0)!=hash;}}
++                await SyncSql(c,t,"""
++                    INSERT INTO focus_sync_remote(binding_id,record_id,source_device_id,server_revision,is_deleted,payload_json,target_id,local_deleted,conflict)
++                    VALUES($binding,$id,$device,$rev,$deleted,$payload,$target,$localDeleted,$conflict)
++                    ON CONFLICT(binding_id,record_id) DO UPDATE SET source_device_id=excluded.source_device_id,server_revision=excluded.server_revision,
++                      is_deleted=excluded.is_deleted,payload_json=excluded.payload_json,target_id=excluded.target_id,
++                      local_deleted=max(focus_sync_remote.local_deleted,excluded.local_deleted),conflict=excluded.conflict
++                    WHERE excluded.server_revision>=focus_sync_remote.server_revision;
++                    """,ct,("$binding",FormatGuid(bindingId)),("$id",FormatGuid(change.RecordId)),("$device",FormatGuid(change.SourceDeviceId)),
++                    ("$rev",change.ServerRevision),("$deleted",change.IsDeleted?1:0),("$payload",change.PayloadJson),
++                    ("$target",change.IsDeleted?null:sessions[change.ServerRevision].TargetId),("$localDeleted",localDeleted?1:0),("$conflict",conflict?1:0));
++                if(change.IsDeleted)await ApplyRemoteTombstone(c,t,b,change.RecordId,change.ServerRevision,ct);
++                else await SyncSql(c,t,"UPDATE focus_sync_owners SET server_revision=max(COALESCE(server_revision,0),$rev) WHERE record_id=$id AND user_id=$user AND api_scope=$scope",ct,
++                    ("$id",FormatGuid(change.RecordId)),("$rev",change.ServerRevision),("$user",FormatGuid(b.UserId!.Value)),("$scope",b.ApiScope));
++            }
++            await SyncSql(c,t,"""
++                INSERT INTO focus_sync_progress(binding_id,cursor,last_revision,has_more,last_pull_utc) VALUES($binding,$cursor,$rev,$more,$now)
++                ON CONFLICT(binding_id) DO UPDATE SET cursor=excluded.cursor,last_revision=excluded.last_revision,
++                  has_more=excluded.has_more,last_pull_utc=excluded.last_pull_utc;
++                """,ct,("$binding",FormatGuid(bindingId)),("$cursor",nextCursor),("$rev",last),("$more",hasMore?1:0),("$now",FormatDateTime(DateTimeOffset.UtcNow)));
++        },ct);
++    }
++
++    public Task ResetFocusDownloadCursorAsync(Guid bindingId,CancellationToken ct=default)=>ExecuteWriteAsync(async(c,t)=>
++    {
++        await SyncBinding(c,t,bindingId,ct);
++        if((await CurrentFocusBinding(c,t,ct))?.BindingId!=bindingId)throw new LocalDataException("同步账号已改变，不能重置旧账号游标。");
++        await SyncSql(c,t,"UPDATE focus_sync_progress SET cursor=NULL,last_revision=0,has_more=1,last_pull_utc=NULL WHERE binding_id=$binding",ct,
++            ("$binding",FormatGuid(bindingId)));
++    },ct);
++
++    private static async Task ApplyRemoteTombstone(SqliteConnection c,SqliteTransaction t,FocusSyncBinding b,Guid id,long revision,CancellationToken ct)
++    {
++        await SyncSql(c,t,"""
++            UPDATE focus_sync_remote SET is_deleted=1,payload_json=NULL,conflict=0,
++              server_revision=max(server_revision,$rev) WHERE binding_id=$binding AND record_id=$id AND server_revision<=$rev;
++            DELETE FROM focus_sessions WHERE session_id=$id AND status=2 AND EXISTS(
++              SELECT 1 FROM focus_sync_owners WHERE record_id=$id AND user_id=$user AND api_scope=$scope);
++            UPDATE focus_sync_owners SET is_deleted=1,server_revision=max(COALESCE(server_revision,0),$rev)
++              WHERE record_id=$id AND user_id=$user AND api_scope=$scope
++              AND NOT EXISTS(SELECT 1 FROM focus_sessions WHERE session_id=$id AND status IN(0,1));
++            UPDATE focus_sync_outbox SET state=3,last_error=NULL WHERE record_id=$id AND user_id=$user AND api_scope=$scope
++              AND kind='upsert' AND state IN(0,2);
++            UPDATE focus_sync_outbox SET state=1,last_error=NULL,next_attempt_utc=NULL,server_revision=$rev
++              WHERE record_id=$id AND user_id=$user AND api_scope=$scope AND kind='delete' AND state IN(0,2);
++            """,ct,("$id",FormatGuid(id)),("$rev",revision),("$user",FormatGuid(b.UserId!.Value)),("$scope",b.ApiScope),("$binding",FormatGuid(b.BindingId)));
++    }
++
++    private static async Task<bool> DeleteVisibleFocus(SqliteConnection c,SqliteTransaction t,Guid id,CancellationToken ct)
++    {
++        var binding=await CurrentFocusBinding(c,t,ct);
++        var nativeAllowed=false;
++        await using(var cmd=CreateCommand(c,t,"""
++            SELECT s.status,o.user_id,o.api_scope FROM focus_sessions s LEFT JOIN focus_sync_owners o ON o.record_id=s.session_id WHERE s.session_id=$id
++            """))
++        {cmd.Parameters.AddWithValue("$id",FormatGuid(id));await using var row=await cmd.ExecuteReaderAsync(ct);
++         if(await row.ReadAsync(ct))nativeAllowed=row.GetInt32(0)!=2||row.IsDBNull(1)||
++            binding is not null&&binding.UserId==Guid.Parse(row.GetString(1))&&binding.ApiScope==row.GetString(2);}
++        if(nativeAllowed)await MarkFocusDeleted(c,t,id,ct);
++        if(binding is not null)
++        {
++            await SyncSql(c,t,"""
++                INSERT OR IGNORE INTO focus_sync_outbox(operation_id,record_id,user_id,api_scope,kind,payload_json,payload_hash,state)
++                  SELECT $op,$id,$user,$scope,'delete','null','delete',0 FROM focus_sync_remote
++                  WHERE binding_id=$binding AND record_id=$id AND is_deleted=0;
++                UPDATE focus_sync_remote SET local_deleted=1 WHERE binding_id=$binding AND record_id=$id;
++                """,ct,("$op",FormatGuid(Guid.NewGuid())),("$id",FormatGuid(id)),("$user",FormatGuid(binding.UserId!.Value)),
++                ("$scope",binding.ApiScope),("$binding",FormatGuid(binding.BindingId)));
++        }
++        return nativeAllowed;
++    }
++
++    private static async Task ValidateFocusOwnership(SqliteConnection c,SqliteTransaction t,LocalFocusSession session,CancellationToken ct)
++    {
++        var expected=session.CloudBindingId is { } id
++            ? id==Guid.Empty?null:await SyncBinding(c,t,id,ct)
++            : await CurrentFocusBinding(c,t,ct);
++        await using var cmd=CreateCommand(c,t,"""
++            SELECT o.user_id,o.api_scope FROM focus_sync_owners o JOIN focus_sessions s ON s.session_id=o.record_id
++            WHERE o.record_id=$id AND o.user_id IS NOT NULL AND s.status=2
++            """);
++        cmd.Parameters.AddWithValue("$id",FormatGuid(session.SessionId));await using var row=await cmd.ExecuteReaderAsync(ct);
++        if(await row.ReadAsync(ct) && (expected is null || expected.UserId!=Guid.Parse(row.GetString(0)) || expected.ApiScope!=row.GetString(1)))
++            throw new LocalDataException("记录已属于其他账号或服务器，不能覆盖。");
++    }
++}
+diff --git a/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusSync.cs b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusSync.cs
+index 6788422..2f3471a 100644
+--- a/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusSync.cs
++++ b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.FocusSync.cs
+@@ -93,9 +93,9 @@ public sealed partial class SqliteLocalDataStore : IFocusSyncStore
+     private static async Task MarkFocusDeleted(SqliteConnection c,SqliteTransaction t,Guid id,CancellationToken ct)
+     {
+         await SyncSql(c,t,"""
+-            UPDATE focus_sync_outbox SET state=3 WHERE record_id=$id AND kind='upsert' AND state=0;
++            UPDATE focus_sync_outbox SET state=3 WHERE record_id=$id AND kind='upsert' AND state IN(0,2);
+             INSERT OR IGNORE INTO focus_sync_outbox(operation_id,record_id,user_id,api_scope,kind,payload_json,payload_hash,state)
+-              SELECT $op,$id,user_id,api_scope,'delete','null','delete',4 FROM focus_sync_owners
++              SELECT $op,$id,user_id,api_scope,'delete','null','delete',0 FROM focus_sync_owners
+               WHERE record_id=$id AND user_id IS NOT NULL AND payload_hash IS NOT NULL;
+             UPDATE focus_sync_owners SET is_deleted=1 WHERE record_id=$id;
+             """,ct,("$id",FormatGuid(id)),("$op",FormatGuid(Guid.NewGuid())));
+@@ -134,7 +134,20 @@ public sealed partial class SqliteLocalDataStore : IFocusSyncStore
+             { await using var reader=await cmd.ExecuteReaderAsync(ct);while(await reader.ReadAsync(ct))unowned.Add(Guid.Parse(reader.GetString(0))); }
+             await using(var cmd=CreateCommand(c,t,"SELECT last_error FROM focus_sync_outbox WHERE user_id=$user AND api_scope=$scope AND state IN (0,2) AND last_error IS NOT NULL LIMIT 1"))
+             {cmd.Parameters.AddWithValue("$user",FormatGuid(b.UserId.Value));cmd.Parameters.AddWithValue("$scope",b.ApiScope);error=await cmd.ExecuteScalarAsync(ct) as string;}
+-            result=new(counts[0],counts[1],counts[2],counts[4],unowned,error);
++            var downloaded=0;var conflicts=0;var deletes=0;var blocked=counts[2];bool more=true;DateTimeOffset? pulled=null;
++            await using(var cmd=CreateCommand(c,t,"SELECT count(*),COALESCE(sum(conflict),0) FROM focus_sync_remote WHERE binding_id=$binding AND is_deleted=0 AND local_deleted=0"))
++            {cmd.Parameters.AddWithValue("$binding",FormatGuid(bindingId));await using var row=await cmd.ExecuteReaderAsync(ct);if(await row.ReadAsync(ct)){downloaded=row.GetInt32(0);conflicts=row.GetInt32(1);}}
++            await using(var cmd=CreateCommand(c,t,"SELECT count(*) FROM focus_sync_outbox WHERE user_id=$user AND api_scope=$scope AND kind='delete' AND state=0"))
++            {cmd.Parameters.AddWithValue("$user",FormatGuid(b.UserId.Value));cmd.Parameters.AddWithValue("$scope",b.ApiScope);deletes=Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));}
++            await using(var cmd=CreateCommand(c,t,"""
++                SELECT count(*) FROM (SELECT record_id FROM focus_sync_outbox WHERE user_id=$user AND api_scope=$scope AND state=2
++                UNION SELECT record_id FROM focus_sync_remote WHERE binding_id=$binding AND conflict=1 AND is_deleted=0 AND local_deleted=0)
++                """))
++            {cmd.Parameters.AddWithValue("$user",FormatGuid(b.UserId.Value));cmd.Parameters.AddWithValue("$scope",b.ApiScope);cmd.Parameters.AddWithValue("$binding",FormatGuid(bindingId));blocked=Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));}
++            await using(var cmd=CreateCommand(c,t,"SELECT has_more,last_pull_utc FROM focus_sync_progress WHERE binding_id=$binding"))
++            {cmd.Parameters.AddWithValue("$binding",FormatGuid(bindingId));await using var row=await cmd.ExecuteReaderAsync(ct);if(await row.ReadAsync(ct)){more=row.GetBoolean(0);pulled=row.IsDBNull(1)?null:ParseDateTime(row.GetString(1));}}
++            result=new(counts[0],counts[1],blocked,deletes,unowned,error)
++            {Downloaded=downloaded,DownloadConflicts=conflicts,HasMoreChanges=more,LastPulledAtUtc=pulled};
+         },ct);return result;
+     }
+     public async Task ImportFocusHistoryAsync(Guid bindingId,IReadOnlyList<Guid> recordIds,CancellationToken ct=default)
+@@ -166,18 +179,22 @@ public sealed partial class SqliteLocalDataStore : IFocusSyncStore
+             await SyncSql(c,t,"UPDATE focus_sync_outbox SET state=2,last_error='local_snapshot_too_large' WHERE user_id=$user AND api_scope=$scope AND state=0 AND length(CAST(payload_json AS BLOB))>262144",ct,
+                 ("$user",FormatGuid(b.UserId!.Value)),("$scope",b.ApiScope));
+             await using var cmd=CreateCommand(c,t,"""
+-                SELECT q.operation_id,q.record_id,q.payload_json FROM focus_sync_outbox q
+-                JOIN focus_sync_owners o ON o.record_id=q.record_id
+-                WHERE q.user_id=$user AND q.api_scope=$scope AND q.state=0 AND q.kind='upsert' AND o.is_deleted=0
+-                  AND q.payload_hash=o.payload_hash AND (q.next_attempt_utc IS NULL OR q.next_attempt_utc<=$now)
+-                ORDER BY q.rowid LIMIT $limit
++                SELECT q.operation_id,q.record_id,q.payload_json,q.kind,COALESCE(o.server_revision,r.server_revision) FROM focus_sync_outbox q
++                LEFT JOIN focus_sync_owners o ON o.record_id=q.record_id AND o.user_id=q.user_id AND o.api_scope=q.api_scope
++                LEFT JOIN focus_sync_bindings b ON b.user_id=q.user_id AND b.api_scope=q.api_scope
++                LEFT JOIN focus_sync_remote r ON r.binding_id=b.binding_id AND r.record_id=q.record_id
++                WHERE q.user_id=$user AND q.api_scope=$scope AND q.state=0
++                  AND (q.kind='delete' OR q.kind='upsert' AND o.is_deleted=0 AND q.payload_hash=o.payload_hash)
++                  AND (q.next_attempt_utc IS NULL OR q.next_attempt_utc<=$now)
++                ORDER BY CASE WHEN q.kind='delete' THEN 0 ELSE 1 END,q.rowid LIMIT $limit
+                 """);
+             cmd.Parameters.AddWithValue("$user",FormatGuid(b.UserId!.Value));cmd.Parameters.AddWithValue("$scope",b.ApiScope);
+             cmd.Parameters.AddWithValue("$now",FormatDateTime(DateTimeOffset.UtcNow));cmd.Parameters.AddWithValue("$limit",Math.Clamp(limit,1,50));
+             await using var reader=await cmd.ExecuteReaderAsync(ct);
+             while(await reader.ReadAsync(ct))
+             {var json=reader.GetString(2);var size=Encoding.UTF8.GetByteCount(json);if(rows.Count>0&&bytes+size>350000)break;
+-             rows.Add(new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),json));bytes+=size;}
++             rows.Add(new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),json)
++                {Kind=reader.GetString(3),BaseRevision=null});bytes+=size;}
+         },ct);return rows;
+     }
+     public async Task ApplyFocusUploadResultsAsync(Guid bindingId,IReadOnlyList<FocusUploadAck> results,CancellationToken ct=default)
+@@ -204,6 +221,13 @@ public sealed partial class SqliteLocalDataStore : IFocusSyncStore
+                     """,ct,("$state",success?1:r.Status=="retry"?0:2),("$error",r.Code is {Length:>128}?r.Code[..128]:r.Code),
+                     ("$rev",r.ServerRevision),("$retry",r.Status=="retry"?1:0),("$success",success?1:0),
+                     ("$op",FormatGuid(r.OperationId)),("$id",FormatGuid(r.RecordId)),("$user",FormatGuid(b.UserId!.Value)),("$scope",b.ApiScope));
++                if(r.Status=="conflict"&&r.Code=="record_deleted"&&r.ServerRevision is >0)
++                {
++                    await using var known=CreateCommand(c,t,"SELECT count(*) FROM focus_sync_outbox WHERE operation_id=$op AND record_id=$id AND user_id=$user AND api_scope=$scope AND kind='upsert'");
++                    known.Parameters.AddWithValue("$op",FormatGuid(r.OperationId));known.Parameters.AddWithValue("$id",FormatGuid(r.RecordId));
++                    known.Parameters.AddWithValue("$user",FormatGuid(b.UserId.Value));known.Parameters.AddWithValue("$scope",b.ApiScope);
++                    if(Convert.ToInt32(await known.ExecuteScalarAsync(ct))>0)await ApplyRemoteTombstone(c,t,b,r.RecordId,r.ServerRevision.Value,ct);
++                }
+             }
+         },ct);
+     }
+diff --git a/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.cs b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.cs
+index c438703..a87fc65 100644
+--- a/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.cs
++++ b/src/FocusApp.Infrastructure/Persistence/SqliteLocalDataStore.cs
+@@ -75,6 +75,7 @@ public sealed partial class SqliteLocalDataStore : ILocalDataStore
+                 sessionWebsiteRules,
+                 sessionApplicationRules,
+                 cancellationToken);
++            sessions = await ProjectFocusHistory(connection, sessions, cancellationToken);
+             var targets = await LoadTargetsAsync(connection, cancellationToken);
+             var tasks = await LoadNormalizedTasksAsync(connection, cancellationToken);
+             var websiteRules = await LoadWebsiteRulesAsync(connection, cancellationToken);
+@@ -180,12 +181,22 @@ public sealed partial class SqliteLocalDataStore : ILocalDataStore
+                 await using var reader=await ids.ExecuteReaderAsync(cancellationToken);
+                 while(await reader.ReadAsync(cancellationToken)) deleting.Add(Guid.Parse(reader.GetString(0)));
+             }
+-            foreach(var id in deleting) await MarkFocusDeleted(connection,transaction,id,cancellationToken);
++            foreach(var id in deleting)
++                if(await DeleteVisibleFocus(connection,transaction,id,cancellationToken))
++                    await SyncSql(connection,transaction,"DELETE FROM focus_sessions WHERE session_id=$session",cancellationToken,("$session",FormatGuid(id)));
++            var binding=await CurrentFocusBinding(connection,transaction,cancellationToken);
++            if(binding is not null)
++            {
++                var remoteIds=new List<Guid>();
++                await using(var ids=CreateCommand(connection,transaction,"SELECT record_id FROM focus_sync_remote WHERE binding_id=$binding AND target_id=$target AND is_deleted=0 AND local_deleted=0"))
++                {ids.Parameters.AddWithValue("$binding",FormatGuid(binding.BindingId));ids.Parameters.AddWithValue("$target",targetId);
++                 await using var rows=await ids.ExecuteReaderAsync(cancellationToken);while(await rows.ReadAsync(cancellationToken))remoteIds.Add(Guid.Parse(rows.GetString(0)));}
++                foreach(var id in remoteIds)await DeleteVisibleFocus(connection,transaction,id,cancellationToken);
++            }
+             await using var command = CreateCommand(
+                 connection,
+                 transaction,
+                 """
+-                DELETE FROM focus_sessions WHERE target_id = $id;
+                 UPDATE automatic_rules SET target_id = NULL, updated_utc = $updated WHERE target_id = $id;
+                 UPDATE app_settings SET selected_target_id = NULL, updated_utc = $updated WHERE selected_target_id = $id;
+                 DELETE FROM targets WHERE target_id = $id;
+@@ -211,6 +222,7 @@ public sealed partial class SqliteLocalDataStore : ILocalDataStore
+ 
+         await ExecuteWriteAsync(async (connection, transaction) =>
+         {
++            await ValidateFocusOwnership(connection, transaction, session, cancellationToken);
+             if (await FocusWasDeleted(connection, transaction, session.SessionId, cancellationToken)) return;
+             await UpsertFocusSessionAsync(connection, transaction, session, cancellationToken);
+             await CaptureFocusOwner(connection, transaction, session, cancellationToken);
+@@ -318,7 +330,7 @@ public sealed partial class SqliteLocalDataStore : ILocalDataStore
+     {
+         await ExecuteWriteAsync(async (connection, transaction) =>
+         {
+-            await MarkFocusDeleted(connection, transaction, sessionId, cancellationToken);
++            if(!await DeleteVisibleFocus(connection, transaction, sessionId, cancellationToken))return;
+             await using var command = CreateCommand(
+                 connection,
+                 transaction,
+@@ -1120,7 +1132,7 @@ public sealed partial class SqliteLocalDataStore : ILocalDataStore
+ 
+     private static SqliteCommand CreateCommand(
+         SqliteConnection connection,
+-        SqliteTransaction transaction,
++        SqliteTransaction? transaction,
+         string sql)
+     {
+         var command = connection.CreateCommand();
+diff --git a/src/FocusApp.Service/LocalDataContractMapper.cs b/src/FocusApp.Service/LocalDataContractMapper.cs
+index dbe6ad6..9bdc65d 100644
+--- a/src/FocusApp.Service/LocalDataContractMapper.cs
++++ b/src/FocusApp.Service/LocalDataContractMapper.cs
+@@ -16,7 +16,7 @@ internal static class LocalDataContractMapper
+             source.AutomaticRules.Select(ToDto).ToArray(),
+             ToDto(source.Settings),
+             source.DurationPresets.Select(ToDto).ToArray(),
+-            source.MonthlyFocusTargets.Select(ToDto).ToArray());
++            source.MonthlyFocusTargets.Select(ToDto).ToArray()) { FocusSyncVersion=5 };
+ 
+     public static LocalTarget ToCore(LocalTargetDto source)
+         => new LocalTarget(source.TargetId, source.Name, source.IsArchived, source.SortOrder, source.CreatedAtUtc, source.UpdatedAtUtc)
+@@ -129,6 +129,7 @@ internal static class LocalDataContractMapper
+                     task.Details.SubTasks.Select(child => new LocalSubTaskSnapshotDto(child.Title, child.IsCompleted)).ToArray())
+             }).ToArray())
+         {
++            CloudBindingId = source.CloudBindingId ?? Guid.Empty,
+             WebsiteRuleSnapshots = source.Status == LocalFocusSessionStatus.Completed
+                 ? []
+                 : source.WebsiteRuleSnapshots.Select(ToDto).ToArray(),
+diff --git a/src/FocusApp.Service/ServiceStateCoordinator.FocusHistory.cs b/src/FocusApp.Service/ServiceStateCoordinator.FocusHistory.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Service/ServiceStateCoordinator.FocusHistory.cs
+@@ -0,0 +1,43 @@
++using System.Collections.Concurrent;
++using System.Text.Json;
++using FocusApp.Contracts;
++
++namespace FocusApp.Service;
++
++public sealed partial class ServiceStateCoordinator
++{
++    private readonly ConcurrentDictionary<Guid,(Guid Binding,LocalFocusSessionDto[] Records)> focusHistoryPages=new();
++    private readonly ConcurrentQueue<Guid> focusHistoryPageOrder=new();
++
++    private LocalDataSnapshotDto PackFocusHistory(LocalDataSnapshotDto state)
++    {
++        if(JsonSerializer.SerializeToUtf8Bytes(state,IpcProtocol.JsonOptions).Length<=600000)return state;
++        var history=state.FocusSessions.Where(x=>x.Status==LocalFocusSessionStatusDto.Completed).ToArray();
++        if(history.Length==0)return state;
++        var token=Guid.NewGuid();focusHistoryPages[token]=(focusSyncBinding,history);focusHistoryPageOrder.Enqueue(token);
++        while(focusHistoryPageOrder.Count>4&&focusHistoryPageOrder.TryDequeue(out var expired))focusHistoryPages.TryRemove(expired,out _);
++        // Keep the newest completion available to existing completion/result flows.
++        var newest=history.OrderByDescending(x=>x.CompletedAtUtc).First();
++        return state with
++        {
++            FocusSessions=state.FocusSessions.Where(x=>x.Status!=LocalFocusSessionStatusDto.Completed).Append(newest).ToArray(),
++            FocusHistoryToken=token,FocusHistoryCount=history.Length
++        };
++    }
++
++    private CloudHistoryPage ReadFocusHistoryPage(CloudHistoryPageCommand request)
++    {
++        if(!focusHistoryPages.TryGetValue(request.Token,out var page)||page.Binding!=focusSyncBinding)
++            throw new ServiceBusinessException("历史快照已更新，请重新读取状态。");
++        if(request.Offset<0||request.Offset>page.Records.Length)throw new ServiceBusinessException("历史分页位置无效。");
++        var records=new List<LocalFocusSessionDto>();var bytes=0;
++        foreach(var record in page.Records.Skip(request.Offset).Take(50))
++        {
++            var size=JsonSerializer.SerializeToUtf8Bytes(record,IpcProtocol.JsonOptions).Length;
++            if(records.Count>0&&bytes+size>350000)break;
++            if(size>800000)throw new ServiceBusinessException("单条本地历史过大，请检查原始记录。");
++            records.Add(record);bytes+=size;
++        }
++        return new(records,request.Offset+records.Count,page.Records.Length);
++    }
++}
+diff --git a/src/FocusApp.Service/ServiceStateCoordinator.FocusSync.cs b/src/FocusApp.Service/ServiceStateCoordinator.FocusSync.cs
+index db9f570..35595c8 100644
+--- a/src/FocusApp.Service/ServiceStateCoordinator.FocusSync.cs
++++ b/src/FocusApp.Service/ServiceStateCoordinator.FocusSync.cs
+@@ -5,6 +5,7 @@ namespace FocusApp.Service;
+ 
+ public sealed partial class ServiceStateCoordinator
+ {
++    private Guid focusSyncBinding;
+     private async Task<IpcEnvelope> HandleFocusSyncAsync(IpcEnvelope request,CancellationToken ct)
+     {
+         if(request.ClientRole!=IpcClientRole.Desktop)
+@@ -18,23 +19,41 @@ public sealed partial class ServiceStateCoordinator
+                 case FocusSyncIpc.Bind:
+                     var command=request.ReadPayload<CloudSyncBindCommand>();
+                     var b=await store.BindFocusAccountAsync(command.UserId,command.ApiScope??"",ct);
++                    if(focusSyncBinding!=b.BindingId){focusSyncBinding=b.BindingId;focusHistoryPages.Clear();Interlocked.Increment(ref _revision);}
+                     return IpcEnvelope.CreateSuccess(request,new CloudSyncBinding(b.BindingId,b.UserId,b.ApiScope));
+                 case FocusSyncIpc.Status:
+                     var status=await store.GetFocusSyncStatusAsync(request.ReadPayload<CloudSyncBindingCommand>().BindingId,ct);
+                     return IpcEnvelope.CreateSuccess(request,new CloudSyncStatus(status.Pending,status.Uploaded,status.Blocked,
+-                        status.DeferredDeletes,status.UnassignedRecordIds,status.LastError));
++                        status.DeferredDeletes,status.UnassignedRecordIds,status.LastError)
++                        {Downloaded=status.Downloaded,DownloadConflicts=status.DownloadConflicts,
++                         HasMoreChanges=status.HasMoreChanges,LastPulledAtUtc=status.LastPulledAtUtc});
+                 case FocusSyncIpc.Import:
+                     var import=request.ReadPayload<CloudSyncImportCommand>();
+-                    await store.ImportFocusHistoryAsync(import.BindingId,import.RecordIds,ct);break;
++                    await store.ImportFocusHistoryAsync(import.BindingId,import.RecordIds,ct);Interlocked.Increment(ref _revision);break;
+                 case FocusSyncIpc.Batch:
+                     var batch=request.ReadPayload<CloudSyncBatchCommand>();
+                     var items=await store.ReadFocusUploadBatchAsync(batch.BindingId,batch.Limit,ct);
+-                    return IpcEnvelope.CreateSuccess(request,new CloudSyncBatch(items.Select(x=>new CloudSyncItem(x.OperationId,x.RecordId,x.PayloadJson)).ToArray()));
++                    return IpcEnvelope.CreateSuccess(request,new CloudSyncBatch(items.Select(x=>new CloudSyncItem(x.OperationId,x.RecordId,x.PayloadJson)
++                        {Kind=x.Kind,BaseRevision=x.BaseRevision}).ToArray()));
+                 case FocusSyncIpc.Ack:
+                     var ack=request.ReadPayload<CloudSyncAckCommand>();
+                     await store.ApplyFocusUploadResultsAsync(ack.BindingId,ack.Results.Select(x=>new FocusUploadAck(x.OperationId,x.RecordId,x.Status,x.ServerRevision,x.Code)).ToArray(),ct);break;
+                 case FocusSyncIpc.Retry:
+                     await store.RetryFocusUploadsAsync(request.ReadPayload<CloudSyncBindingCommand>().BindingId,ct);break;
++                case FocusSyncIpc.Cursor:
++                    var cursor=await store.GetFocusDownloadStateAsync(request.ReadPayload<CloudSyncBindingCommand>().BindingId,ct);
++                    return IpcEnvelope.CreateSuccess(request,new CloudSyncCursor(cursor.Cursor,cursor.LastRevision));
++                case FocusSyncIpc.Apply:
++                    var page=request.ReadPayload<CloudSyncApplyCommand>();
++                    await store.ApplyFocusChangesAsync(page.BindingId,page.ExpectedCursor,page.NextCursor,page.HasMore,
++                        page.Changes.Select(x=>new FocusRemoteChange(x.RecordId,x.SourceDeviceId,x.ServerRevision,x.IsDeleted,x.PayloadJson)).ToArray(),ct);
++                    if(page.Changes.Count>0)Interlocked.Increment(ref _revision);
++                    break;
++                case FocusSyncIpc.HistoryPage:
++                    var history=request.ReadPayload<CloudHistoryPageCommand>();
++                    return IpcEnvelope.CreateSuccess(request,ReadFocusHistoryPage(history));
++                case FocusSyncIpc.Reset:
++                    await store.ResetFocusDownloadCursorAsync(request.ReadPayload<CloudSyncBindingCommand>().BindingId,ct);break;
+                 default: throw new ServiceBusinessException("未知上传操作。");
+             }
+             return IpcEnvelope.CreateSuccess(request,new EmptyPayload());
+diff --git a/src/FocusApp.Service/ServiceStateCoordinator.cs b/src/FocusApp.Service/ServiceStateCoordinator.cs
+index 2469417..4c27917 100644
+--- a/src/FocusApp.Service/ServiceStateCoordinator.cs
++++ b/src/FocusApp.Service/ServiceStateCoordinator.cs
+@@ -408,7 +408,7 @@ public sealed partial class ServiceStateCoordinator : IAsyncDisposable
+     }
+ 
+     private async Task<LocalDataSnapshotDto> LoadStateAsync(CancellationToken cancellationToken)
+-        => LocalDataContractMapper.ToDto(await _store.LoadAsync(cancellationToken), Volatile.Read(ref _revision));
++        => PackFocusHistory(LocalDataContractMapper.ToDto(await _store.LoadAsync(cancellationToken), Volatile.Read(ref _revision)));
+ 
+     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
+     {
+diff --git a/tests/FocusApp.Tests/Infrastructure/SqliteLocalDataStoreTests.cs b/tests/FocusApp.Tests/Infrastructure/SqliteLocalDataStoreTests.cs
+index a61bb1b..1a5f449 100644
+--- a/tests/FocusApp.Tests/Infrastructure/SqliteLocalDataStoreTests.cs
++++ b/tests/FocusApp.Tests/Infrastructure/SqliteLocalDataStoreTests.cs
+@@ -139,7 +139,7 @@ public sealed class SqliteLocalDataStoreTests
+         Assert.Equal("父任务", restored.Name); Assert.Equal("保留备注", restored.Description);
+         Assert.Equal("子任务", Assert.Single(restored.SubTasks).Title);
+         Assert.Null(restored.FlagColor); Assert.Null(restored.SubTasks[0].FlagColor);
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+     }
+ 
+     [Fact]
+@@ -161,7 +161,7 @@ public sealed class SqliteLocalDataStoreTests
+             await command.ExecuteNonQueryAsync();
+         }
+         Assert.Equal(settings with { FocusCharacterId = "white_boy01" }, (await database.CreateStore().LoadAsync()).Settings);
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+     }
+ 
+     [Theory]
+@@ -196,7 +196,7 @@ public sealed class SqliteLocalDataStoreTests
+             await command.ExecuteNonQueryAsync();
+         }
+         var after = await database.CreateStore().LoadAsync();
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+         Assert.Equal(FocusThemeMode.System, after.Settings.FocusTheme);
+         Assert.Equal(before.Settings, after.Settings);
+         Assert.Equal(before.Targets, after.Targets);
+@@ -286,7 +286,7 @@ public sealed class SqliteLocalDataStoreTests
+         }
+ 
+         var migrated = await database.CreateStore().LoadAsync();
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+         Assert.False(await ColumnExistsAsync(database.Path, "app_settings", "selected_theme_key"));
+         Assert.Equal(before.Settings, migrated.Settings);
+         Assert.Equal(before.Targets, migrated.Targets);
+@@ -477,7 +477,7 @@ public sealed class SqliteLocalDataStoreTests
+         persisted = Assert.Single(Assert.Single((await database.CreateStore().LoadAsync()).FocusSessions).CompletedTasks);
+         Assert.Equal("当时的名称", persisted.TaskNameSnapshot);
+         Assert.Null(persisted.Details);
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+     }
+ 
+     [Fact]
+@@ -562,7 +562,7 @@ public sealed class SqliteLocalDataStoreTests
+         Assert.Equal(now, migrated.CompletedAtUtc);
+         Assert.Equal(string.Empty, migrated.Description);
+         Assert.Empty(migrated.SubTasks);
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+     }
+ 
+     [Fact]
+@@ -590,7 +590,7 @@ public sealed class SqliteLocalDataStoreTests
+         await store.InitializeAsync();
+         var snapshot = await store.LoadAsync();
+ 
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+         Assert.Empty(snapshot.FocusSessions);
+         Assert.Empty(snapshot.Targets);
+         Assert.Empty(snapshot.Tasks);
+@@ -629,7 +629,7 @@ public sealed class SqliteLocalDataStoreTests
+ 
+         await database.CreateStore().InitializeAsync();
+ 
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+         Assert.True(await TableExistsAsync(database.Path, "focus_session_website_rules"));
+         Assert.True(await TableExistsAsync(database.Path, "focus_session_application_rules"));
+         Assert.True(await ColumnExistsAsync(database.Path, "targets", "icon_file_name"));
+@@ -912,7 +912,7 @@ public sealed class SqliteLocalDataStoreTests
+         Assert.Equal("旧目标", migrated.Name);
+         Assert.Equal("study.png", migrated.IconFileName);
+         Assert.Null(migrated.IconColorHex);
+-        Assert.Equal(15, await ReadUserVersionAsync(database.Path));
++        Assert.Equal(16, await ReadUserVersionAsync(database.Path));
+     }
+ 
+     [Fact]
+diff --git a/tests/FocusApp.Tests/Sync/CloudBidirectionalLiveTests.cs b/tests/FocusApp.Tests/Sync/CloudBidirectionalLiveTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Sync/CloudBidirectionalLiveTests.cs
+@@ -0,0 +1,130 @@
++using System.Net;
++using System.Net.Http;
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++using System.Text.RegularExpressions;
++using FocusApp.Contracts;
++using FocusApp.Core;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Tests.Desktop;
++using Xunit;
++
++namespace FocusApp.Tests.Sync;
++
++public sealed class CloudBidirectionalLiveTests
++{
++    private sealed class Network : DelegatingHandler
++    {
++        public Network():base(new HttpClientHandler{AllowAutoRedirect=false}){}
++        public bool LoseNextDelete {get;set;}
++        public bool BlockDownloads {get;set;}
++        public List<(Guid OperationId,string Kind)> Attempts {get;}=[];
++        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct)
++        {
++            if(BlockDownloads&&request.RequestUri!.AbsolutePath.EndsWith("/focus-records/changes"))throw new HttpRequestException("Offline download");
++            var deleting=false;
++            if(request.RequestUri!.AbsolutePath.EndsWith("/focus-records/push"))
++            {
++                using var body=JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
++                foreach(var item in body.RootElement.GetProperty("operations").EnumerateArray())
++                {var kind=item.GetProperty("kind").GetString()!;Attempts.Add((item.GetProperty("operationId").GetGuid(),kind));deleting|=kind=="delete";}
++            }
++            var response=await base.SendAsync(request,ct);
++            if(deleting&&LoseNextDelete&&response.IsSuccessStatusCode)
++            {LoseNextDelete=false;response.Dispose();throw new HttpRequestException("Lost committed deletion response");}
++            return response;
++        }
++    }
++
++    private static LocalFocusSessionDto Dto(LocalFocusSession s)=>new(s.SessionId,LocalFocusSessionStatusDto.Completed,
++        s.IsForcedMode,s.ConfiguredSeconds,s.ActualSeconds,s.PreparationStartedAtUtc,s.FocusStartedAtUtc,s.PlannedEndAtUtc,
++        s.CompletedAtUtc,FocusCompletionKindDto.Natural,s.TargetId,s.TargetNameSnapshot,s.BlockingEnabled,s.AutomaticRuleId,s.AutomaticOccurrenceStartedAtUtc,
++        s.CompletedTasks.Select(x=>new LocalFocusSessionTaskSnapshotDto(x.TaskId,x.TaskNameSnapshot,x.SortOrder)
++        {CompletedAtUtc=x.CompletedAtUtc,Details=x.Details is null?null:new(x.Details.Description,x.Details.SubTasks.Select(y=>new LocalSubTaskSnapshotDto(y.Title,y.IsCompleted)).ToArray())}).ToArray())
++        {CloudBindingId=s.CloudBindingId};
++
++    [LiveAccountFact]
++    public async Task TwoIndependentDevices_DownloadDeleteRetryAndSwitchAccountsWithoutResurrectionOrTaskSideEffects()
++    {
++        await using var a=new FocusSyncHarness();await using var b=new FocusSyncHarness();await a.ConnectAsync();await b.ConnectAsync();
++        var endpoint=new Uri(Environment.GetEnvironmentVariable("FOCUSTIME_TEST_API")!);
++        var mail=Environment.GetEnvironmentVariable("FOCUSTIME_TEST_MAIL")!;
++        using var httpA=new HttpClient{BaseAddress=endpoint};var networkB=new Network();using var httpB=new HttpClient(networkB){BaseAddress=endpoint};
++        var vaultA=new WindowsCredentialStore(endpoint,Path.Combine(a.DirectoryPath,"credentials"));
++        var vaultB=new WindowsCredentialStore(endpoint,Path.Combine(b.DirectoryPath,"credentials"));
++        var cloudA=new CloudAccountClient(httpA,vaultA);var cloudB=new CloudAccountClient(httpB,vaultB);
++        const string password="BiSyncClient123";
++        var email="bidirectional-"+Guid.NewGuid().ToString("N")+"@example.test";
++        async Task Register(CloudAccountClient cloud,string address)
++        {
++            var challenge=await cloud.SendCodeAsync(address,false);
++            var message=Directory.GetFiles(mail,"*.eml").Select(File.ReadAllText).Single(x=>x.Contains(address,StringComparison.OrdinalIgnoreCase));
++            var separator=message.IndexOf("\r\n\r\n",StringComparison.Ordinal);var body=message[(separator+4)..].Trim();
++            if(message[..separator].Contains("base64",StringComparison.OrdinalIgnoreCase))body=Encoding.UTF8.GetString(Convert.FromBase64String(body));
++            await cloud.RegisterAsync(address,challenge.ChallengeId,Regex.Match(body,"[0-9]{6}").Value,password);
++        }
++        async Task<HttpResponseMessage> Read(CloudAccountClient cloud,HttpClient http,WindowsCredentialStore vault,Guid id)
++        {
++            Assert.NotNull(await cloud.GetUploadIdentityAsync());
++            using var request=new HttpRequestMessage(HttpMethod.Get,"api/v1/focus-records/"+id);
++            request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",vault.Load().Tokens!.AccessToken);
++            return await http.SendAsync(request);
++        }
++        await Register(cloudA,email);await cloudA.LoginAsync(email,password);await cloudB.LoginAsync(email,password);
++        Assert.NotEqual(vaultA.Load().InstallationId,vaultB.Load().InstallationId);
++        var workerA=new FocusUploadCoordinator(a.Connection,cloudA,false);var workerB=new FocusUploadCoordinator(b.Connection,cloudB,false);
++        await workerA.TickAsync();await workerB.TickAsync();
++        var now=DateTimeOffset.UtcNow;
++        await b.Store.SaveTargetAsync(new("goal","local goal",false,0,now,now),[new("task","goal","live task",false,0,now,now)]);
++        var record=FocusSyncHarness.Record(a.Connection.CloudBindingId);await a.Connection.RecordCompletedFocusAsync(Dto(record));
++        var original=Assert.Single(await a.Store.ReadFocusUploadBatchAsync(a.Connection.CloudBindingId,50));
++        await workerA.TickAsync();await workerB.TickAsync();
++        var downloaded=Assert.Single((await b.Store.LoadAsync()).FocusSessions);Assert.Equal(record.SessionId,downloaded.SessionId);
++        Assert.Equal("步骤",downloaded.CompletedTasks[0].Details!.SubTasks[0].Title);Assert.False(Assert.Single((await b.Store.LoadAsync()).Tasks).IsCompleted);
++        Assert.Contains("已下载 1",workerB.Summary);
++
++        await b.Connection.DeleteFocusRecordAsync(record.SessionId);networkB.LoseNextDelete=true;networkB.BlockDownloads=true;
++        await workerB.TickAsync();Assert.Empty((await b.Store.LoadAsync()).FocusSessions);
++        Assert.Equal(1,(await b.Store.GetFocusSyncStatusAsync(b.Connection.CloudBindingId)).Pending);
++        Assert.Equal(HttpStatusCode.NotFound,(await Read(cloudA,httpA,vaultA,record.SessionId)).StatusCode);
++        // Persistent backoff may hide it; clear only the retry time, retaining operation ID and payload.
++        await b.Connection.FocusSyncRequestAsync<CloudSyncBindingCommand,EmptyPayload>(FocusSyncIpc.Retry,new(b.Connection.CloudBindingId));
++        var pending=Assert.Single(await b.Store.ReadFocusUploadBatchAsync(b.Connection.CloudBindingId,50));
++        Assert.Equal(networkB.Attempts.Last(x=>x.Kind=="delete").OperationId,pending.OperationId);
++        networkB.BlockDownloads=false;await workerB.TickAsync();
++        var deletionAttempts=networkB.Attempts.Where(x=>x.Kind=="delete").ToArray();Assert.Equal(2,deletionAttempts.Length);
++        Assert.Equal(deletionAttempts[0].OperationId,deletionAttempts[1].OperationId);
++        await workerA.TickAsync();Assert.Empty((await a.Store.LoadAsync()).FocusSessions);
++        var identity=(await cloudA.GetUploadIdentityAsync())!;
++        Assert.Equal("duplicate",Assert.Single(await cloudA.PushFocusRecordsAsync(identity,[new(original.OperationId,record.SessionId,original.PayloadJson)])).Status);
++        Assert.Equal("record_deleted",Assert.Single(await cloudA.PushFocusRecordsAsync(identity,[new(Guid.NewGuid(),record.SessionId,original.PayloadJson)])).Code);
++        Assert.Equal(HttpStatusCode.NotFound,(await Read(cloudA,httpA,vaultA,record.SessionId)).StatusCode);
++
++        var goal=FocusSyncHarness.Record(a.Connection.CloudBindingId);var other=FocusSyncHarness.Record(a.Connection.CloudBindingId) with{TargetId="other",TargetNameSnapshot="other snapshot"};
++        await a.Connection.RecordCompletedFocusAsync(Dto(goal));await a.Connection.RecordCompletedFocusAsync(Dto(other));await workerA.TickAsync();await workerB.TickAsync();
++        Assert.False(Assert.Single((await b.Store.LoadAsync()).Tasks).IsCompleted);
++        await b.Connection.DeleteTargetAsync(new("goal"));await workerB.TickAsync();await workerA.TickAsync();
++        Assert.Equal(other.SessionId,Assert.Single((await a.Store.LoadAsync()).FocusSessions).SessionId);
++        Assert.Equal(other.SessionId,Assert.Single((await b.Store.LoadAsync()).FocusSessions).SessionId);
++        Assert.Empty((await b.Store.LoadAsync()).Targets);
++
++        var privateEmail="private-"+Guid.NewGuid().ToString("N")+"@example.test";await Register(cloudB,privateEmail);
++        await cloudB.LoginAsync(privateEmail,password);await FocusSyncHarness.WaitAsync(()=>!workerB.IsBusy&&b.Connection.CloudBindingId!=Guid.Empty);
++        await workerB.TickAsync();Assert.Empty((await b.Store.LoadAsync()).FocusSessions);
++        var privateRecord=FocusSyncHarness.Record(b.Connection.CloudBindingId,other.SessionId) with{TargetNameSnapshot="private account snapshot"};
++        await b.Connection.RecordCompletedFocusAsync(Dto(privateRecord));await workerB.TickAsync();
++        Assert.Equal("private account snapshot",Assert.Single((await b.Store.LoadAsync()).FocusSessions).TargetNameSnapshot);
++        await cloudB.LoginAsync(email,password);await FocusSyncHarness.WaitAsync(()=>!workerB.IsBusy&&b.Connection.CloudBindingId!=Guid.Empty);
++        await workerB.TickAsync();Assert.Equal("other snapshot",Assert.Single((await b.Store.LoadAsync()).FocusSessions).TargetNameSnapshot);
++        Assert.Equal("other snapshot",(await a.Store.LoadAsync()).FocusSessions.Single().TargetNameSnapshot);
++
++        var neverUploaded=FocusSyncHarness.Record(b.Connection.CloudBindingId);await b.Connection.RecordCompletedFocusAsync(Dto(neverUploaded));
++        await b.Connection.DeleteFocusRecordAsync(neverUploaded.SessionId);await workerB.TickAsync();await workerA.TickAsync();
++        Assert.DoesNotContain((await a.Store.LoadAsync()).FocusSessions,x=>x.SessionId==neverUploaded.SessionId);
++        var rejected=Assert.Single(await cloudA.PushFocusRecordsAsync(identity,[new(Guid.NewGuid(),neverUploaded.SessionId,FocusDownloadStoreTests.Payload(neverUploaded))]));
++        Assert.Equal("record_deleted",rejected.Code);
++        await cloudB.LogoutAsync();await FocusSyncHarness.WaitAsync(()=>!workerB.IsBusy&&b.Connection.CloudBindingId==Guid.Empty);
++        Assert.Empty((await b.Store.LoadAsync()).FocusSessions);
++    }
++}
+diff --git a/tests/FocusApp.Tests/Sync/FocusBidirectionalWorkerTests.cs b/tests/FocusApp.Tests/Sync/FocusBidirectionalWorkerTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Sync/FocusBidirectionalWorkerTests.cs
+@@ -0,0 +1,120 @@
++using System.Net;
++using System.Net.Http;
++using System.Net.Http.Json;
++using System.Security.Cryptography;
++using System.Text;
++using FocusApp.Contracts;
++using FocusApp.Core;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Tests.Desktop;
++using Microsoft.Data.Sqlite;
++using Xunit;
++
++namespace FocusApp.Tests.Sync;
++
++public sealed class FocusBidirectionalWorkerTests
++{
++    private sealed class Cloud : IFocusUploadClient,IFocusDownloadClient
++    {
++        public event EventHandler? IdentityChanged;
++        public FocusUploadIdentity Identity {get;private set;}=new(Guid.NewGuid(),"a@example.test",FocusDownloadStoreTests.Scope);
++        public Func<FocusUploadIdentity,string?,Task<CloudSyncChanges>> Pull {get;set;}=(_,cursor)=>Task.FromResult(new CloudSyncChanges([],cursor??"zero",false));
++        public Task<FocusUploadIdentity?> GetUploadIdentityAsync()=>Task.FromResult<FocusUploadIdentity?>(Identity);
++        public Task<IReadOnlyList<CloudSyncAck>> PushFocusRecordsAsync(FocusUploadIdentity identity,IReadOnlyList<CloudSyncItem> items)
++            =>Task.FromResult<IReadOnlyList<CloudSyncAck>>(items.Select(x=>new CloudSyncAck(x.OperationId,x.RecordId,"applied",1,null)).ToArray());
++        public Task<CloudSyncChanges> PullFocusRecordsAsync(FocusUploadIdentity identity,string? cursor)=>Pull(identity,cursor);
++        public void Change(){Identity=new(Guid.NewGuid(),"b@example.test",FocusDownloadStoreTests.Scope);IdentityChanged?.Invoke(this,EventArgs.Empty);}
++    }
++    private static CloudSyncChange Change(LocalFocusSession s,long rev=1)=>new(s.SessionId,Guid.NewGuid(),rev,false,FocusDownloadStoreTests.Payload(s));
++
++    [Fact]
++    public async Task WaitingForDownloadNeverHoldsTheLocalWriteGate()
++    {
++        await using var h=new FocusSyncHarness();await h.ConnectAsync();var entered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var release=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);var remote=FocusSyncHarness.Record();
++        var cloud=new Cloud{Pull=async(_,_)=>{entered.TrySetResult();await release.Task;return new([Change(remote)],"c1",false);}};
++        var worker=new FocusUploadCoordinator(h.Connection,cloud,false);var syncing=worker.TickAsync();await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
++        await h.Store.SaveFocusSessionAsync(FocusSyncHarness.Record(h.Connection.CloudBindingId)).WaitAsync(TimeSpan.FromSeconds(3));
++        release.SetResult();await syncing;Assert.Equal(2,(await h.Store.LoadAsync()).FocusSessions.Count);
++    }
++
++    [Fact]
++    public async Task AccountChangeClearsVisibleHistoryImmediatelyAndDiscardsAnInFlightOldPage()
++    {
++        await using var h=new FocusSyncHarness();await h.ConnectAsync();var cloud=new Cloud();var user=cloud.Identity.UserId;
++        var first=FocusSyncHarness.Record();var late=FocusSyncHarness.Record();
++        var entered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);var release=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        cloud.Pull=async(identity,cursor)=>
++        {
++            if(identity.UserId!=user)return new([],"b0",false);
++            if(cursor is null)return new([Change(first)],"a1",false);
++            entered.TrySetResult();await release.Task;return new([Change(late,2)],"a2",false);
++        };
++        var worker=new FocusUploadCoordinator(h.Connection,cloud,false);await worker.TickAsync();var oldBinding=h.Connection.CloudBindingId;
++        Assert.Single(h.Connection.State!.FocusSessions);var inFlight=worker.TickAsync();await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
++        cloud.Change();Assert.Empty(h.Connection.State.FocusSessions);release.SetResult();await inFlight;await worker.TickAsync();
++        Assert.Empty((await h.Store.LoadAsync()).FocusSessions);Assert.Equal("a1",(await h.Store.GetFocusDownloadStateAsync(oldBinding)).Cursor);
++    }
++
++    [Fact]
++    public async Task CursorWriteFailureCannotBeReportedAsSuccessfulSynchronization()
++    {
++        await using var h=new FocusSyncHarness();await h.ConnectAsync();var cloud=new Cloud{Pull=(_,_)=>Task.FromResult(new CloudSyncChanges([Change(FocusSyncHarness.Record())],"c1",false))};
++        await using(var c=new SqliteConnection("Data Source="+h.DatabasePath))
++        {await c.OpenAsync();var command=c.CreateCommand();command.CommandText="CREATE TRIGGER fail_download BEFORE INSERT ON focus_sync_progress BEGIN SELECT RAISE(ABORT,'test failure'); END;";await command.ExecuteNonQueryAsync();}
++        var worker=new FocusUploadCoordinator(h.Connection,cloud,false);await worker.TickAsync();
++        Assert.Contains("暂不可用",worker.Status);Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
++        Assert.Null((await h.Store.GetFocusDownloadStateAsync(h.Connection.CloudBindingId)).Cursor);
++    }
++
++    private sealed class Handler(Func<HttpResponseMessage> send):HttpMessageHandler
++    {
++        public int Calls {get;private set;}
++        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct)
++        {Calls++;return Task.FromResult(send());}
++    }
++
++    [Fact]
++    public async Task PullRejectsWrongIdentityBeforeHttpAndRejectsAnEmptyNonfinalPage()
++    {
++        var uri=new Uri("http://localhost:5080/");var uid=Guid.NewGuid();
++        var token=new CloudTokens("Bearer",new string('A',64),DateTimeOffset.UtcNow.AddMinutes(15),new string('B',64),DateTimeOffset.UtcNow.AddDays(30),Guid.NewGuid(),Guid.NewGuid(),new(uid,"a@example.test",true));
++        var vault=new CloudAccountClientTests.MemoryStore{State=new(Guid.NewGuid(),token,null,[])};
++        var handler=new Handler(()=>new(HttpStatusCode.OK){Content=JsonContent.Create(new{changes=Array.Empty<object>(),nextCursor="same",hasMore=true})});
++        using var http=new HttpClient(handler){BaseAddress=uri};var client=new CloudAccountClient(http,vault);
++        var identity=new FocusUploadIdentity(uid,"a@example.test",Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(uri.AbsoluteUri))));
++        Assert.Equal("account_changed",(await Assert.ThrowsAsync<CloudApiException>(()=>client.PullFocusRecordsAsync(identity with{UserId=Guid.NewGuid()},null))).Code);Assert.Equal(0,handler.Calls);
++        Assert.Equal("invalid_sync_response",(await Assert.ThrowsAsync<CloudApiException>(()=>client.PullFocusRecordsAsync(identity,null))).Code);Assert.Equal(1,handler.Calls);
++    }
++
++    [Fact]
++    public async Task InvalidServerCursorRestartsTheFeedWithoutDroppingCachedHistory()
++    {
++        await using var h=new FocusSyncHarness();var cloud=new Cloud();var binding=await h.Store.BindFocusAccountAsync(cloud.Identity.UserId,cloud.Identity.ApiScope);
++        var record=FocusSyncHarness.Record();await h.Store.ApplyFocusChangesAsync(binding.BindingId,null,"old-key-cursor",false,[FocusDownloadStoreTests.Change(record)]);
++        await h.ConnectAsync();var calls=new List<string?>();
++        cloud.Pull=(_,cursor)=>
++        {
++            calls.Add(cursor);if(cursor=="old-key-cursor")throw new CloudApiException("invalid_sync_cursor");
++            return Task.FromResult(new CloudSyncChanges([Change(record)],"new-key-cursor",false));
++        };
++        var worker=new FocusUploadCoordinator(h.Connection,cloud,false);await worker.TickAsync();
++        Assert.Equal(new string?[]{"old-key-cursor",null},calls);Assert.Equal("new-key-cursor",(await h.Store.GetFocusDownloadStateAsync(binding.BindingId)).Cursor);
++        Assert.Equal(record.SessionId,Assert.Single((await h.Store.LoadAsync()).FocusSessions).SessionId);Assert.Contains("已同步",worker.Status);
++    }
++
++    [Fact]
++    public async Task PagedHistoryTokenCannotBeReadByAgentOrAfterAccountSwitch()
++    {
++        await using var h=new FocusSyncHarness();var user=Guid.NewGuid();var binding=await h.Store.BindFocusAccountAsync(user,FocusDownloadStoreTests.Scope);
++        var changes=Enumerable.Range(1,50).Select(i=>FocusDownloadStoreTests.Change(FocusSyncHarness.Record() with
++            {CompletedTasks=[new("task","task",0){Details=new(new string('x',15000),[])}]},i)).ToArray();
++        await h.Store.ApplyFocusChangesAsync(binding.BindingId,null,"c1",false,changes);
++        await h.RequestAsync<CloudSyncBinding>(FocusSyncIpc.Bind,new CloudSyncBindCommand(user,FocusDownloadStoreTests.Scope));
++        var state=await h.RequestAsync<LocalDataSnapshotDto>(IpcOperations.GetState,new EmptyPayload());Assert.NotNull(state.FocusHistoryToken);
++        var page=new CloudHistoryPageCommand(state.FocusHistoryToken!.Value,0);
++        Assert.Equal(IpcErrorCode.UnauthorizedClient,(await Assert.ThrowsAsync<IpcRemoteException>(()=>h.RequestAsync<CloudHistoryPage>(FocusSyncIpc.HistoryPage,page,IpcClientRole.Agent))).Error.Code);
++        await h.RequestAsync<CloudSyncBinding>(FocusSyncIpc.Bind,new CloudSyncBindCommand(Guid.NewGuid(),FocusDownloadStoreTests.Scope));
++        Assert.Equal(IpcErrorCode.BusinessRejected,(await Assert.ThrowsAsync<IpcRemoteException>(()=>h.RequestAsync<CloudHistoryPage>(FocusSyncIpc.HistoryPage,page))).Error.Code);
++    }
++}
+diff --git a/tests/FocusApp.Tests/Sync/FocusDownloadStoreTests.cs b/tests/FocusApp.Tests/Sync/FocusDownloadStoreTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Sync/FocusDownloadStoreTests.cs
+@@ -0,0 +1,174 @@
++using System.Text.Json;
++using FocusApp.Contracts;
++using FocusApp.Core;
++using FocusApp.Infrastructure.Persistence;
++using Microsoft.Data.Sqlite;
++using Xunit;
++
++namespace FocusApp.Tests.Sync;
++
++public sealed class FocusDownloadStoreTests
++{
++    internal const string Scope="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
++    internal static string Payload(LocalFocusSession s)=>JsonSerializer.Serialize(new
++    {
++        s.ConfiguredSeconds,s.ActualSeconds,s.PreparationStartedAtUtc,s.FocusStartedAtUtc,s.PlannedEndAtUtc,s.CompletedAtUtc,
++        completionKind=s.CompletionKind==FocusCompletionKind.Natural?"natural":"earlyEnd",s.IsForcedMode,
++        s.TargetId,s.TargetNameSnapshot,s.BlockingEnabled,s.AutomaticRuleId,s.AutomaticOccurrenceStartedAtUtc,
++        completedTasks=s.CompletedTasks.OrderBy(x=>x.SortOrder).ThenBy(x=>x.TaskId,StringComparer.Ordinal).Select(x=>new
++        {x.TaskId,x.TaskNameSnapshot,x.SortOrder,completedAtUtc=x.CompletedAtUtc??s.CompletedAtUtc,x.Details})
++    },new JsonSerializerOptions(JsonSerializerDefaults.Web));
++    internal static FocusRemoteChange Change(LocalFocusSession s,long revision=1)=>new(s.SessionId,Guid.NewGuid(),revision,false,Payload(s));
++
++    [Fact]
++    public async Task DownloadAndCursorCommitTogether_AndFailedOrOutOfOrderPageRollsBack()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);
++        var a=FocusSyncHarness.Record();var other=FocusSyncHarness.Record();
++        await Assert.ThrowsAsync<LocalDataException>(()=>h.Store.ApplyFocusChangesAsync(b.BindingId,null,"bad-order",false,[Change(a,2),Change(other,1)]));
++        Assert.Null((await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
++        await using(var c=new SqliteConnection("Data Source="+h.DatabasePath))
++        {await c.OpenAsync();var cmd=c.CreateCommand();cmd.CommandText="CREATE TRIGGER fail_cursor BEFORE INSERT ON focus_sync_progress BEGIN SELECT RAISE(ABORT,'test cursor failure'); END;";await cmd.ExecuteNonQueryAsync();}
++        await Assert.ThrowsAsync<LocalDataException>(()=>h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(a)]));
++        Assert.Null((await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
++        await using(var c=new SqliteConnection("Data Source="+h.DatabasePath))
++        {await c.OpenAsync();var cmd=c.CreateCommand();cmd.CommandText="DROP TRIGGER fail_cursor;";await cmd.ExecuteNonQueryAsync();}
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(a)]);
++        var restarted=new SqliteLocalDataStore(h.DatabasePath);Assert.Equal("c1",(await restarted.GetFocusDownloadStateAsync(b.BindingId)).Cursor);
++        Assert.Equal(a.SessionId,Assert.Single((await restarted.LoadAsync()).FocusSessions).SessionId);
++        await Assert.ThrowsAsync<LocalDataException>(()=>restarted.ApplyFocusChangesAsync(b.BindingId,null,"replay",false,[Change(a)]));
++        Assert.Single((await restarted.LoadAsync()).FocusSessions);
++    }
++
++    [Fact]
++    public async Task SnapshotsDisplayWithoutLocalTargets_AndImportNeverCompletesRealTasksOrQueuesUploads()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var now=DateTimeOffset.UtcNow;
++        await h.Store.SaveTargetAsync(new("goal","live goal",false,0,now,now),[new("task","goal","live task",false,0,now,now)]);
++        var s=FocusSyncHarness.Record() with{TargetId="missing-on-this-device",TargetNameSnapshot="云端目标快照"};
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(s)]);
++        var state=await h.Store.LoadAsync();var downloaded=Assert.Single(state.FocusSessions);
++        Assert.Equal("云端目标快照",downloaded.TargetNameSnapshot);Assert.Equal("步骤",downloaded.CompletedTasks[0].Details!.SubTasks[0].Title);
++        Assert.Empty(downloaded.WebsiteRuleSnapshots);Assert.Empty(downloaded.ApplicationRuleSnapshots);
++        Assert.False(Assert.Single(state.Tasks).IsCompleted);Assert.Equal("goal",Assert.Single(state.Targets).TargetId);
++        Assert.Empty(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++    }
++
++    [Fact]
++    public async Task SameIdDifferentContentKeepsNativeHistoryAndReportsConflict()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record(b.BindingId);
++        await h.Store.SaveFocusSessionAsync(s);
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(s with{TargetNameSnapshot="other device version"})]);
++        Assert.Equal(s.TargetNameSnapshot,Assert.Single((await h.Store.LoadAsync()).FocusSessions).TargetNameSnapshot);
++        Assert.Equal(1,(await h.Store.GetFocusSyncStatusAsync(b.BindingId)).Blocked);
++        Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++    }
++
++    [Fact]
++    public async Task AccountAndApiSwitchHideOtherHistoryAndKeepSeparateCursorsEvenWhenRecordIdsCollide()
++    {
++        await using var h=new FocusSyncHarness();var guest=FocusSyncHarness.Record(Guid.Empty);await h.Store.SaveFocusSessionAsync(guest);
++        var a=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record(a.BindingId);await h.Store.SaveFocusSessionAsync(s);
++        await h.Store.ApplyFocusChangesAsync(a.BindingId,null,"a1",false,[Change(s)]);
++        var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);
++        Assert.Equal(guest.SessionId,Assert.Single((await h.Store.LoadAsync()).FocusSessions).SessionId);
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"b1",false,[Change(s with{TargetNameSnapshot="B snapshot"})]);
++        Assert.Equal("B snapshot",(await h.Store.LoadAsync()).FocusSessions.Single(x=>x.SessionId==s.SessionId).TargetNameSnapshot);
++        await h.Store.BindFocusAccountAsync(null,"");Assert.Equal(guest.SessionId,Assert.Single((await h.Store.LoadAsync()).FocusSessions).SessionId);
++        await h.Store.BindFocusAccountAsync(a.UserId,Scope);Assert.Equal(s.TargetNameSnapshot,(await h.Store.LoadAsync()).FocusSessions.Single(x=>x.SessionId==s.SessionId).TargetNameSnapshot);
++        Assert.Equal("a1",(await h.Store.GetFocusDownloadStateAsync(a.BindingId)).Cursor);Assert.Equal("b1",(await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);
++        await h.Store.BindFocusAccountAsync(a.UserId,new string('B',64));Assert.Equal(guest.SessionId,Assert.Single((await h.Store.LoadAsync()).FocusSessions).SessionId);
++        await Assert.ThrowsAsync<LocalDataException>(()=>h.Store.ApplyFocusChangesAsync(a.BindingId,"a1","a2",false,[]));
++    }
++
++    [Fact]
++    public async Task DownloadedDeleteIsDurableAndOldUpsertCannotUndoIt()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record();
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(s)]);await h.Store.DeleteFocusSessionAsync(s.SessionId);
++        var deletion=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));Assert.Equal("delete",deletion.Kind);Assert.Null(deletion.BaseRevision);
++        var restarted=new SqliteLocalDataStore(h.DatabasePath);Assert.Equal(deletion.OperationId,Assert.Single(await restarted.ReadFocusUploadBatchAsync(b.BindingId,50)).OperationId);
++        await restarted.ApplyFocusChangesAsync(b.BindingId,"c1","c2",false,[Change(s,2)]);Assert.Empty((await restarted.LoadAsync()).FocusSessions);
++        await restarted.ApplyFocusChangesAsync(b.BindingId,"c2","c3",false,[new(s.SessionId,Guid.NewGuid(),3,true,null)]);
++        Assert.Empty((await restarted.LoadAsync()).FocusSessions);Assert.Empty(await restarted.ReadFocusUploadBatchAsync(b.BindingId,50));
++        Assert.Equal("c3",(await restarted.GetFocusDownloadStateAsync(b.BindingId)).Cursor);
++    }
++
++    [Fact]
++    public async Task TargetDeletionOnlyDeletesVisibleAccountHistoryAndPreservesOtherAccountSnapshots()
++    {
++        await using var h=new FocusSyncHarness();var now=DateTimeOffset.UtcNow;await h.Store.SaveTargetAsync(new("goal","goal",false,0,now,now),[]);
++        var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var other=FocusSyncHarness.Record(b.BindingId);await h.Store.SaveFocusSessionAsync(other);
++        var a=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var native=FocusSyncHarness.Record(a.BindingId);await h.Store.SaveFocusSessionAsync(native);
++        var remote=FocusSyncHarness.Record();await h.Store.ApplyFocusChangesAsync(a.BindingId,null,"a1",false,[Change(remote)]);
++        await h.Store.DeleteTargetAsync("goal");Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
++        var deletes=await h.Store.ReadFocusUploadBatchAsync(a.BindingId,50);Assert.Equal(2,deletes.Count);Assert.All(deletes,x=>Assert.Equal("delete",x.Kind));
++        await h.Store.BindFocusAccountAsync(b.UserId,Scope);var state=await h.Store.LoadAsync();Assert.Equal(other.SessionId,Assert.Single(state.FocusSessions).SessionId);
++        Assert.Equal(other.TargetNameSnapshot,state.FocusSessions[0].TargetNameSnapshot);Assert.Empty(state.Targets);Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++    }
++
++    [Fact]
++    public async Task UnknownAcknowledgementCannotDeleteHistory_AndDeletePayloadStaysStableAcrossLateAck()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record(b.BindingId);await h.Store.SaveFocusSessionAsync(s);
++        await h.Store.ApplyFocusUploadResultsAsync(b.BindingId,[new(Guid.NewGuid(),s.SessionId,"conflict",7,"record_deleted")]);Assert.Single((await h.Store.LoadAsync()).FocusSessions);
++        var upload=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));await h.Store.DeleteFocusSessionAsync(s.SessionId);
++        var before=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++        await h.Store.ApplyFocusUploadResultsAsync(b.BindingId,[new(upload.OperationId,s.SessionId,"applied",7,null)]);
++        var after=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));Assert.Equal(before,after);Assert.Null(after.BaseRevision);
++    }
++
++    [Fact]
++    public async Task StageFourDeferredDeleteMigratesToSendableWithoutChangingItsId()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record(b.BindingId);
++        await h.Store.SaveFocusSessionAsync(s);await h.Store.DeleteFocusSessionAsync(s.SessionId);var deletion=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++        await using(var c=new SqliteConnection("Data Source="+h.DatabasePath))
++        {await c.OpenAsync();var command=c.CreateCommand();command.CommandText="UPDATE focus_sync_outbox SET state=4 WHERE kind='delete'; DROP TABLE focus_sync_remote; DROP TABLE focus_sync_progress; PRAGMA user_version=15;";await command.ExecuteNonQueryAsync();}
++        var upgraded=new SqliteLocalDataStore(h.DatabasePath);await upgraded.InitializeAsync();var item=Assert.Single(await upgraded.ReadFocusUploadBatchAsync(b.BindingId,50));
++        Assert.Equal(deletion.OperationId,item.OperationId);Assert.Equal("delete",item.Kind);
++    }
++
++    [Fact]
++    public async Task CursorResetRetainsUnsyncedRecordsAndPendingDeletesDuringFullReplay()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var remote=FocusSyncHarness.Record();
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(remote)]);await h.Store.DeleteFocusSessionAsync(remote.SessionId);
++        var native=FocusSyncHarness.Record(b.BindingId);await h.Store.SaveFocusSessionAsync(native);
++        var before=(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50)).Select(x=>x.OperationId).ToHashSet();
++        await h.Store.ResetFocusDownloadCursorAsync(b.BindingId);Assert.Null((await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"new1",false,[Change(remote)]);
++        Assert.Equal(native.SessionId,Assert.Single((await h.Store.LoadAsync()).FocusSessions).SessionId);
++        Assert.True(before.SetEquals((await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50)).Select(x=>x.OperationId)));
++    }
++
++    [Fact]
++    public async Task AReplayedVersionCannotChangeContentOrReviveATombstone()
++    {
++        await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record();
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(s)]);await h.Store.ResetFocusDownloadCursorAsync(b.BindingId);
++        await Assert.ThrowsAsync<LocalDataException>(()=>h.Store.ApplyFocusChangesAsync(b.BindingId,null,"bad",false,[Change(s with{TargetNameSnapshot="different content"})]));
++        Assert.Null((await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);Assert.Equal(s.TargetNameSnapshot,Assert.Single((await h.Store.LoadAsync()).FocusSessions).TargetNameSnapshot);
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,null,"c1",false,[Change(s)]);
++        await h.Store.ApplyFocusChangesAsync(b.BindingId,"c1","c2",false,[new(s.SessionId,Guid.NewGuid(),2,true,null)]);
++        await Assert.ThrowsAsync<LocalDataException>(()=>h.Store.ApplyFocusChangesAsync(b.BindingId,"c2","bad3",false,[Change(s,3)]));
++        Assert.Equal("c2",(await h.Store.GetFocusDownloadStateAsync(b.BindingId)).Cursor);Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
++    }
++
++    [Fact]
++    public async Task LargeHistoryIsReassembledAcrossBoundedRealIpcPages()
++    {
++        await using var h=new FocusSyncHarness();var user=Guid.NewGuid();var b=await h.Store.BindFocusAccountAsync(user,Scope);string? cursor=null;
++        for(var page=0;page<4;page++)
++        {
++            var changes=Enumerable.Range(1,50).Select(i=>Change(FocusSyncHarness.Record() with
++                {CompletedTasks=[new("task","task",0){Details=new(new string('x',9000),[])}]},page*50+i)).ToArray();
++            var next="page"+page;await h.Store.ApplyFocusChangesAsync(b.BindingId,cursor,next,page<3,changes);cursor=next;
++        }
++        await h.ConnectAsync();var binding=await h.Connection.FocusSyncRequestAsync<CloudSyncBindCommand,CloudSyncBinding>(FocusSyncIpc.Bind,new(user,Scope));
++        h.Connection.UseCloudBinding(binding.BindingId);var state=await h.Connection.RefreshStateAsync();
++        Assert.Equal(200,state.FocusSessions.Count);Assert.Null(state.FocusHistoryToken);Assert.Equal(200,state.FocusSessions.Select(x=>x.SessionId).Distinct().Count());
++        Assert.True(JsonSerializer.SerializeToUtf8Bytes(state,IpcProtocol.JsonOptions).Length>IpcProtocol.MaximumFrameBytes);
++    }
++}
+diff --git a/tests/FocusApp.Tests/Sync/FocusOutboxTests.cs b/tests/FocusApp.Tests/Sync/FocusOutboxTests.cs
+index e774f84..2b64a50 100644
+--- a/tests/FocusApp.Tests/Sync/FocusOutboxTests.cs
++++ b/tests/FocusApp.Tests/Sync/FocusOutboxTests.cs
+@@ -65,7 +65,8 @@ public sealed class FocusOutboxTests
+         await using var h=new FocusSyncHarness();var b=await h.Store.BindFocusAccountAsync(Guid.NewGuid(),Scope);var s=FocusSyncHarness.Record(b.BindingId);await h.Store.SaveFocusSessionAsync(s);
+         var item=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));await h.Store.DeleteFocusSessionAsync(s.SessionId);
+         await h.Store.ApplyFocusUploadResultsAsync(b.BindingId,[new(item.OperationId,item.RecordId,"applied",7,null)]);
+-        Assert.Equal(1,(await h.Store.GetFocusSyncStatusAsync(b.BindingId)).DeferredDeletes);Assert.Empty(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));
++        Assert.Equal(1,(await h.Store.GetFocusSyncStatusAsync(b.BindingId)).DeferredDeletes);
++        var deletion=Assert.Single(await h.Store.ReadFocusUploadBatchAsync(b.BindingId,50));Assert.Equal("delete",deletion.Kind);Assert.Equal(s.SessionId,deletion.RecordId);
+         await h.Store.SaveFocusSessionAsync(s);Assert.Empty((await h.Store.LoadAsync()).FocusSessions);
+     }
+     [Fact]

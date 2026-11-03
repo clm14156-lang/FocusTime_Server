@@ -1,0 +1,112 @@
+diff --git a/scripts/Start-LocalLoginServer.ps1 b/scripts/Start-LocalLoginServer.ps1
+index 991ede8..24e901f 100644
+--- a/scripts/Start-LocalLoginServer.ps1
++++ b/scripts/Start-LocalLoginServer.ps1
+@@ -17,6 +17,28 @@ $dotnet = Join-Path $ServerRoot '.tools\dotnet\dotnet.exe'
+ $pgBin = Join-Path $ServerRoot '.tools\pgsql\bin'
+ $apiDll = Join-Path $ServerRoot 'src\FocusTime.Api\bin\Release\net10.0\FocusTime.Api.dll'
+ $baseUrl = "http://localhost:$ApiPort/"
++$lanSettingsFile = Join-Path $localRoot 'lan-settings.json'
++$lan = $null
++$lanBaseUrl = $null
++$databaseListenAddresses = '127.0.0.1'
++if (Test-Path -LiteralPath $lanSettingsFile) {
++    $lan = Get-Content -Raw -LiteralPath $lanSettingsFile | ConvertFrom-Json
++    $lanAddress = $null
++    if (-not [Net.IPAddress]::TryParse([string]$lan.Address, [ref]$lanAddress) -or
++        $lanAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
++        [Net.IPAddress]::IsLoopback($lanAddress) -or [int]$lan.HttpsPort -notin 1024..65535 -or
++        [string]$lan.CertificateSubject -notmatch '^FocusTime-LAN-[0-9.]+$') {
++        throw 'Invalid lan-settings.json. Re-run the backend scripts/Enable-LanDevelopment.ps1.'
++    }
++    $localAddresses = [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
++        ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
++        ForEach-Object { $_.Address.ToString() }
++    if ([string]$lan.Address -notin $localAddresses) {
++        throw 'The saved LAN IP is no longer assigned to this computer. Re-run Enable-LanDevelopment.ps1.'
++    }
++    $databaseListenAddresses = '127.0.0.1,' + $lan.Address
++    $lanBaseUrl = 'https://{0}:{1}/' -f $lan.Address, $lan.HttpsPort
++}
+ 
+ foreach ($required in @($dotnet, $apiDll, "$pgBin\initdb.exe", "$pgBin\pg_ctl.exe")) {
+     if (-not (Test-Path -LiteralPath $required)) {
+@@ -29,7 +51,11 @@ if (Test-Path -LiteralPath $stateFile) {
+     $state = Get-Content -Raw -LiteralPath $stateFile | ConvertFrom-Json
+     $existing = Get-Process -Id $state.ApiProcessId -ErrorAction SilentlyContinue
+     if ($existing -and $existing.StartTime.ToUniversalTime().Ticks.ToString() -eq $state.ApiStartTicks) {
++        if ([string]$state.LanBaseUrl -ne [string]$lanBaseUrl) {
++            throw 'LAN settings changed. Run Stop-LocalLoginServer.ps1, then start again.'
++        }
+         Write-Output "Local login API is already running: $($state.BaseUrl)"
++        if ($lanBaseUrl) { Write-Output "LAN API: $lanBaseUrl" }
+         Write-Output "Readiness: $($state.BaseUrl)health/ready"
+         Write-Output "Development mail: $mailDirectory"
+         return
+@@ -43,6 +69,12 @@ foreach ($port in @($ApiPort, $DatabasePort)) {
+     catch { throw "Port $port is unavailable. Stop the existing service or choose a different port." }
+     finally { $listener.Stop() }
+ }
++if ($lan) {
++    $listener = New-Object Net.Sockets.TcpListener($lanAddress, [int]$lan.HttpsPort)
++    try { $listener.Start() }
++    catch { throw 'The LAN HTTPS port is unavailable. Choose a different HttpsPort.' }
++    finally { $listener.Stop() }
++}
+ 
+ if (-not (Test-Path -LiteralPath $passwordFile)) {
+     if (Test-Path -LiteralPath (Join-Path $dataDirectory 'PG_VERSION')) {
+@@ -77,11 +109,31 @@ try {
+             if (Test-Path -LiteralPath $temporaryPassword) { Remove-Item -LiteralPath $temporaryPassword }
+         }
+     }
+-    & "$pgBin\pg_ctl.exe" -D $dataDirectory -l (Join-Path $localRoot 'postgres.log') -o "-h 127.0.0.1 -p $DatabasePort" -w start
++    & "$pgBin\pg_ctl.exe" -D $dataDirectory -l (Join-Path $localRoot 'postgres.log') -o "-h $databaseListenAddresses -p $DatabasePort" -w start
+     if ($LASTEXITCODE -ne 0) { throw 'Database startup failed. See postgres.log.' }
+     $databaseStarted = $true
+ 
+     Copy-Item -LiteralPath (Join-Path $ServerRoot 'src\FocusTime.Api\appsettings.json') -Destination $contentRoot -Force
++    if ($lan) {
++        $apiSettingsFile = Join-Path $contentRoot 'appsettings.json'
++        $apiSettings = Get-Content -Raw -LiteralPath $apiSettingsFile | ConvertFrom-Json
++        $kestrel = @{
++            Endpoints = @{
++                LocalHttp = @{ Url = $baseUrl }
++                LanHttps = @{
++                    Url = $lanBaseUrl
++                    Certificate = @{
++                        Subject = $lan.CertificateSubject
++                        Store = 'My'
++                        Location = 'CurrentUser'
++                        AllowInvalid = $false
++                    }
++                }
++            }
++        }
++        $apiSettings | Add-Member -NotePropertyName Kestrel -NotePropertyValue $kestrel -Force
++        $apiSettings | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $apiSettingsFile -Encoding UTF8
++    }
+     $env:DOTNET_ROOT = Split-Path -Parent $dotnet
+     $env:ASPNETCORE_ENVIRONMENT = 'Development'
+     $env:ConnectionStrings__Database = "Host=127.0.0.1;Port=$DatabasePort;Database=postgres;Username=postgres;Password=$password;Timeout=3;Command Timeout=5"
+@@ -110,9 +162,15 @@ try {
+         DotnetPath = $dotnet
+         PgBin = $pgBin
+         BaseUrl = $baseUrl
++        LanBaseUrl = $lanBaseUrl
++        DatabasePort = $DatabasePort
+     } | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
+     $completed = $true
+     Write-Output "Local login API ready: ${baseUrl}health/ready"
++    if ($lanBaseUrl) {
++        Write-Output "LAN API: $lanBaseUrl"
++        Write-Output "LAN PostgreSQL: $($lan.Address):$DatabasePort"
++    }
+     Write-Output "Development mail: $mailDirectory"
+     Write-Output "Client setting: `$env:FOCUSTIME_API_BASE_URL = '$baseUrl'"
+     Write-Output 'Stop with: .\scripts\Stop-LocalLoginServer.ps1'
+@@ -126,3 +184,4 @@ finally {
+         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+     }
+ }
++

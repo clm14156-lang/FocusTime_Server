@@ -1,0 +1,1356 @@
+diff --git a/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs b/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
+index 24a17cf..179d3db 100644
+--- a/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
++++ b/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
+@@ -1,4 +1,6 @@
+ using System.ComponentModel;
++using FocusApp.Desktop.Services.Cloud;
++using System.Net.Http;
+ using System.Runtime.CompilerServices;
+ using System.Windows.Input;
+ using System.Windows.Threading;
+@@ -25,19 +27,31 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+     private int _resendSecondsRemaining;
+     private readonly DispatcherTimer _resendTimer;
+ 
+-    public AuthModalViewModel()
++    private readonly IAccountClient _accounts;
++    private Guid _registerChallenge;
++    private Guid _resetChallenge;
++    private string _resetTicket = "";
++    private bool _isBusy;
++    private string _statusMessage = "";
++    private bool _agreementAccepted;
++    private string _sessionStatus = "";
++
++    public AuthModalViewModel(IAccountClient? accounts = null)
+     {
++        _accounts = accounts ?? CloudAccountClient.CreateDefault();
++        RegisterCommand = new AsyncCommand(() => RunAsync(RegisterAsync));
++        SendRegisterCodeCommand = new AsyncCommand(() => RunAsync(SendRegisterCodeAsync));
+         CloseCommand = new RelayCommand<object>(_ => Close());
+         ShowLoginCommand = new RelayCommand<object>(_ => ShowLogin());
+         ShowRegisterCommand = new RelayCommand<object>(_ => ShowRegister());
+-        LoginCommand = new RelayCommand<object>(_ => Login());
++        LoginCommand = new AsyncCommand(() => RunAsync(LoginAsync));
+         StartPasswordRecoveryCommand = new RelayCommand<object>(_ => StartPasswordRecovery());
+         PasswordRecoveryBackCommand = new RelayCommand<object>(_ => GoBackInPasswordRecovery());
+-        ContinueRecoveryCommand = new RelayCommand<object>(_ => ContinueRecovery());
+-        VerifyRecoveryCodeCommand = new RelayCommand<object>(_ => VerifyRecoveryCode());
+-        CompletePasswordRecoveryCommand = new RelayCommand<object>(_ => CompletePasswordRecovery());
++        ContinueRecoveryCommand = new AsyncCommand(() => RunAsync(ContinueRecoveryAsync));
++        VerifyRecoveryCodeCommand = new AsyncCommand(() => RunAsync(VerifyRecoveryCodeAsync));
++        CompletePasswordRecoveryCommand = new AsyncCommand(() => RunAsync(CompletePasswordRecoveryAsync));
+         ReturnToLoginCommand = new RelayCommand<object>(_ => ReturnToLogin());
+-        ResendRecoveryCodeCommand = new RelayCommand<object>(_ => ResendRecoveryCode());
++        ResendRecoveryCodeCommand = new AsyncCommand(() => RunAsync(ResendRecoveryCodeAsync));
+ 
+         _resendTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+         _resendTimer.Tick += (_, _) =>
+@@ -280,8 +294,9 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+         IsOpen = true;
+     }
+ 
+-    public void ClearSimulatedAccountData()
++    public void ClearAccountForm()
+     {
++        ClearPasswords();
+         IsOpen = false;
+         IsRegistration = false;
+         IsPasswordRecovery = false;
+@@ -297,6 +312,8 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+ 
+     private void Close()
+     {
++        if (IsBusy) return;
++        ClearPasswords();
+         _resendTimer.Stop();
+         IsOpen = false;
+     }
+@@ -326,33 +343,35 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+         ResendSecondsRemaining = 0;
+     }
+ 
+-    private void ContinueRecovery()
++    private async Task ContinueRecoveryAsync()
+     {
+-        if (!CanContinueRecovery)
+-        {
+-            return;
+-        }
+-
++        if (!CanContinueRecovery) return;
++        var challenge = await _accounts.SendCodeAsync(RecoveryAccount.Trim(), true);
++        _resetChallenge = challenge.ChallengeId;
+         PasswordRecoveryStep = PasswordRecoveryStep.Verification;
+         RecoveryCode = string.Empty;
+-        StartResendCountdown();
++        StartResendCountdown(challenge.ResendAfterSeconds);
++        StatusMessage = "如果邮箱已注册，验证码已发送，请检查收件箱。";
+     }
+ 
+-    private void VerifyRecoveryCode()
++    private async Task VerifyRecoveryCodeAsync()
+     {
+-        if (CanVerifyRecoveryCode)
+-        {
+-            _resendTimer.Stop();
+-            PasswordRecoveryStep = PasswordRecoveryStep.NewPassword;
+-        }
++        if (!CanVerifyRecoveryCode) return;
++        var ticket = await _accounts.VerifyResetAsync(_resetChallenge, RecoveryCode);
++        _resetTicket = ticket.ResetTicketValue;
++        _resendTimer.Stop();
++        PasswordRecoveryStep = PasswordRecoveryStep.NewPassword;
+     }
+ 
+-    private void CompletePasswordRecovery()
++    private async Task CompletePasswordRecoveryAsync()
+     {
+-        if (CanCompletePasswordRecovery)
+-        {
+-            PasswordRecoveryStep = PasswordRecoveryStep.Completed;
+-        }
++        if (!CanCompletePasswordRecovery) return;
++        await _accounts.CompleteResetAsync(_resetTicket, RecoveryNewPassword);
++        _resetTicket = "";
++        ClearPasswords();
++        PasswordRecoveryStep = PasswordRecoveryStep.Completed;
++        await _accounts.LogoutAsync();
++        SessionCleared?.Invoke(this, EventArgs.Empty);
+     }
+ 
+     private void GoBackInPasswordRecovery()
+@@ -384,24 +403,22 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+         ResetPasswordRecovery();
+     }
+ 
+-    private void ResendRecoveryCode()
++    private async Task ResendRecoveryCodeAsync()
+     {
+-        if (IsResendAvailable)
+-        {
+-            RecoveryCode = string.Empty;
+-            StartResendCountdown();
+-        }
++        if (IsResendAvailable) await ContinueRecoveryAsync();
+     }
+ 
+-    private void StartResendCountdown()
++    private void StartResendCountdown(int seconds = 60)
+     {
+-        ResendSecondsRemaining = 55;
++        ResendSecondsRemaining = seconds;
+         _resendTimer.Stop();
+         _resendTimer.Start();
+     }
+ 
+     private void ResetPasswordRecovery()
+     {
++        _resetTicket = "";
++        _resetChallenge = Guid.Empty;
+         _resendTimer.Stop();
+         PasswordRecoveryStep = PasswordRecoveryStep.Account;
+         RecoveryAccount = string.Empty;
+@@ -411,28 +428,105 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+         ResendSecondsRemaining = 0;
+     }
+ 
+-    private void Login()
++    private async Task LoginAsync()
++    {
++        var account = await _accounts.LoginAsync(LoginAccount.Trim(), LoginPassword);
++        HasLoginError = false;
++        ClearPasswords();
++        IsOpen = false;
++        LoginSucceeded?.Invoke(this, new LoginSucceededEventArgs(account.Email, account.Membership));
++    }
++
++    private async Task SendRegisterCodeAsync()
++    {
++        if (!IsResendAvailable) return;
++        var challenge = await _accounts.SendCodeAsync(RegisterEmail.Trim(), false);
++        _registerChallenge = challenge.ChallengeId;
++        StartResendCountdown(challenge.ResendAfterSeconds);
++        StatusMessage = "验证码已发送，请检查邮箱。";
++    }
++
++    private async Task RegisterAsync()
++    {
++        if (!AgreementAccepted) { StatusMessage = "请先阅读并同意用户协议和隐私政策。"; return; }
++        if (RegisterPassword != RegisterConfirmPassword) { StatusMessage = "两次输入的密码不一致。"; return; }
++        await _accounts.RegisterAsync(RegisterEmail.Trim(), _registerChallenge, RegisterCode, RegisterPassword);
++        LoginAccount = RegisterEmail.Trim();
++        ClearPasswords();
++        RegisterCode = "";
++        _registerChallenge = Guid.Empty;
++        ShowLogin();
++        StatusMessage = "注册成功，请使用邮箱和密码登录。";
++    }
++
++    public async Task RestoreSessionAsync()
+     {
+-        var account = LoginAccount.Trim();
+-        var membershipType = (account, LoginPassword) switch
++        if (IsBusy) return;
++        try
+         {
+-            ("123", "123") => MembershipType.Normal,
+-            ("456", "456") => MembershipType.Annual,
+-            ("789", "789") => MembershipType.Lifetime,
+-            _ => (MembershipType?)null
+-        };
++            var account = await _accounts.RestoreAsync();
++            if (account is null) { SessionStatus = ""; SessionCleared?.Invoke(this, EventArgs.Empty); return; }
++            SessionStatus = account.IsOffline ? "离线：暂时无法验证云端会话" : "云端会话已连接";
++            LoginSucceeded?.Invoke(this, new LoginSucceededEventArgs(account.Email, account.Membership));
++        }
++        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or CloudApiException or
++            System.IO.IOException or System.UnauthorizedAccessException or System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException)
++        { SessionStatus = "暂时无法恢复云端会话，请稍后重试。"; }
++    }
+ 
+-        if (membershipType is null)
++    public Task LogoutAsync() => RunAsync(async () =>
++    {
++        await _accounts.LogoutAsync();
++        SessionCleared?.Invoke(this, EventArgs.Empty);
++    });
++
++    private async Task RunAsync(Func<Task> action)
++    {
++        if (IsBusy) return;
++        IsBusy = true;
++        StatusMessage = "正在处理，请稍候…";
++        try { await action(); if (StatusMessage == "正在处理，请稍候…") StatusMessage = ""; }
++        catch (CloudApiException ex)
+         {
+             HasLoginError = true;
+-            return;
++            StatusMessage = ex.Code switch
++            {
++                "invalid_credentials" => "邮箱或密码不正确。",
++                "invalid_code" => "验证码无效、已使用或已过期，请重新获取。",
++                "email_registered" => "该邮箱已经注册，请登录或找回密码。",
++                "password_policy_failed" => "密码需要 8–128 个字符，并包含字母和数字。",
++                "invalid_reset_ticket" => "重置凭证已过期，请重新找回密码。",
++                "account_locked" => "登录失败次数过多，请在 15 分钟后重试。",
++                "email_rate_limited" or "rate_limit_exceeded" => "操作过于频繁，请稍后再试。",
++                "email_unavailable" => "邮件服务暂不可用，请稍后再试。",
++                "validation_failed" or "invalid_device" => "请检查邮箱、验证码和密码格式。",
++                _ => "请求未完成，请稍后重试。"
++            };
+         }
++        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
++        { HasLoginError = true; StatusMessage = "无法连接服务器，请检查网络后重试。"; }
++        catch (Exception ex) when (ex is System.IO.IOException or System.UnauthorizedAccessException or
++            System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException)
++        { StatusMessage = "无法安全保存或读取账号状态，请稍后重试。"; }
++        finally { IsBusy = false; }
++    }
+ 
+-        HasLoginError = false;
+-        IsOpen = false;
+-        LoginSucceeded?.Invoke(this, new LoginSucceededEventArgs(account, membershipType.Value));
++    private void ClearPasswords()
++    {
++        LoginPassword = RegisterPassword = RegisterConfirmPassword = RecoveryNewPassword = RecoveryConfirmPassword = "";
++        PasswordsCleared?.Invoke(this, EventArgs.Empty);
+     }
+ 
++    public event EventHandler? SessionCleared;
++    public event EventHandler? PasswordsCleared;
++    public ICommand RegisterCommand { get; }
++    public ICommand SendRegisterCodeCommand { get; }
++    public bool IsBusy { get => _isBusy; private set { SetField(ref _isBusy, value); OnPropertyChanged(nameof(IsIdle)); } }
++    public bool IsIdle => !IsBusy;
++    public string StatusMessage { get => _statusMessage; private set => SetField(ref _statusMessage, value); }
++    public string SessionStatus { get => _sessionStatus; private set => SetField(ref _sessionStatus, value); }
++    public bool AgreementAccepted { get => _agreementAccepted; set => SetField(ref _agreementAccepted, value); }
++
+     private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+     {
+         if (EqualityComparer<T>.Default.Equals(field, value))
+diff --git a/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs b/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
+index a7dd1f5..1966ee7 100644
+--- a/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
++++ b/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
+@@ -1,3 +1,4 @@
++using FocusApp.Desktop.Services.Cloud;
+ using System.Collections.ObjectModel;
+ using System.ComponentModel;
+ using System.Runtime.CompilerServices;
+@@ -51,7 +52,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+         StatisticsOverviewViewModel? statisticsPage = null,
+         DesktopServiceConnection? serviceConnection = null,
+         IAudioService? audioService = null,
+-        BrowserExtensionModalViewModel? browserExtensionModal = null)
++        BrowserExtensionModalViewModel? browserExtensionModal = null,
++        IAccountClient? accountClient = null)
+     {
+         PrimaryNavigationItems = new ReadOnlyCollection<NavigationItemViewModel>(
+             primaryNavigationItems.ToList());
+@@ -135,8 +137,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+             Interval = TimeSpan.FromSeconds(3)
+         };
+         _focusResultToastTimer.Tick += (_, _) => CloseFocusResultToast();
+-        AuthModal = new AuthModalViewModel();
++        AuthModal = new AuthModalViewModel(accountClient);
+         AuthModal.LoginSucceeded += AuthModal_LoginSucceeded;
++        AuthModal.SessionCleared += (_, _) => ClearAccountSession();
++        // Only the real application owns the periodic cloud session maintenance.
++        if (accountClient is null && System.Windows.Application.Current is not null)
++        {
++            var accountTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
++            accountTimer.Tick += async (_, _) => await AuthModal.RestoreSessionAsync();
++            accountTimer.Start();
++            Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () => await AuthModal.RestoreSessionAsync()));
++        }
+         AccountSyncModal.AccountDeletionConfirmed += AccountSyncModal_AccountDeletionConfirmed;
+         _currentNavigationItem = PrimaryNavigationItems[0];
+         _currentNavigationItem.IsSelected = true;
+@@ -406,7 +417,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+ 
+     public string CurrentUserEmail => string.IsNullOrEmpty(_currentAccount)
+         ? string.Empty
+-        : $"{_currentAccount}@focusapp.local";
++        : _currentAccount;
+ 
+     private void OpenAuth()
+     {
+@@ -422,6 +433,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+ 
+     private void AuthModal_LoginSucceeded(object? sender, LoginSucceededEventArgs e)
+     {
++        if (IsLoggedIn && _currentAccount == e.Account && MembershipType == e.MembershipType) return;
+         _currentAccount = e.Account;
+         MembershipType = e.MembershipType;
+         OnPropertyChanged(nameof(CurrentUserEmail));
+@@ -459,13 +471,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+         AccountSyncModal.Open();
+     }
+ 
+-    private void Logout()
++    private async void Logout()
+     {
+-        ClearAccountSession();
++        await AuthModal.LogoutAsync();
+     }
+ 
+-    private void AccountSyncModal_AccountDeletionConfirmed(object? sender, EventArgs e)
++    private async void AccountSyncModal_AccountDeletionConfirmed(object? sender, EventArgs e)
+     {
++        await AuthModal.LogoutAsync();
+         ClearAccountSession(clearSimulatedAccountData: true);
+         var homeNavigationItem = PrimaryNavigationItems.FirstOrDefault(item => item.Page == NavigationPage.Home)
+             ?? PrimaryNavigationItems[0];
+@@ -480,7 +493,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+         MembershipCenter.CloseCommand.Execute(null);
+         if (clearSimulatedAccountData)
+         {
+-            AuthModal.ClearSimulatedAccountData();
++            AuthModal.ClearAccountForm();
+         }
+ 
+         _currentAccount = string.Empty;
+diff --git a/src/FocusApp.Desktop/Views/AccountPanel.xaml b/src/FocusApp.Desktop/Views/AccountPanel.xaml
+index 91ce1f3..52b4526 100644
+--- a/src/FocusApp.Desktop/Views/AccountPanel.xaml
++++ b/src/FocusApp.Desktop/Views/AccountPanel.xaml
+@@ -103,7 +103,7 @@
+ 
+                 <StackPanel Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center">
+                     <StackPanel Orientation="Horizontal">
+-                        <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}" Text="{DynamicResource AccountPanelLoggedIn}" />
++                        <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}" Text="{DynamicResource AccountPanelLoggedIn}" ToolTip="{Binding AuthModal.SessionStatus}" />
+                         <Ellipse Width="7" Height="7" Margin="7,1,0,0" VerticalAlignment="Center" Fill="{DynamicResource Success}" />
+                         <Border Margin="8,0,0,0"
+                                 Padding="7,1"
+diff --git a/src/FocusApp.Desktop/Views/AuthModal.xaml b/src/FocusApp.Desktop/Views/AuthModal.xaml
+index 5b59a23..9518302 100644
+--- a/src/FocusApp.Desktop/Views/AuthModal.xaml
++++ b/src/FocusApp.Desktop/Views/AuthModal.xaml
+@@ -125,7 +125,7 @@
+             MouseDown="AuthCard_MouseDown">
+         <Grid x:Name="CloseButtonHost">
+         <Grid Margin="28,0">
+-            <Grid x:Name="LoginPanel" TextElement.FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI">
++            <Grid IsEnabled="{Binding IsIdle}" x:Name="LoginPanel" TextElement.FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI">
+                 <Grid.Style>
+                     <Style TargetType="{x:Type Grid}">
+                         <Setter Property="Visibility" Value="Visible" />
+@@ -361,7 +361,7 @@
+                            Text="{DynamicResource AuthSyncHint}" />
+             </Grid>
+ 
+-            <Grid x:Name="PasswordRecoveryPanel">
++            <Grid IsEnabled="{Binding IsIdle}" x:Name="PasswordRecoveryPanel">
+                 <Grid.Style>
+                     <Style TargetType="{x:Type Grid}">
+                         <Setter Property="Visibility" Value="Collapsed" />
+@@ -607,7 +607,7 @@
+                 </Grid>
+             </Grid>
+ 
+-            <Grid x:Name="RegisterPanel" TextElement.FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI">
++            <Grid IsEnabled="{Binding IsIdle}" x:Name="RegisterPanel" TextElement.FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI">
+                 <Grid.Style>
+                     <Style TargetType="{x:Type Grid}">
+                         <Setter Property="Visibility" Value="Collapsed" />
+@@ -774,7 +774,7 @@
+                         <Button Grid.Column="2"
+                                 HorizontalAlignment="Stretch"
+                                 Padding="0"
+-                                Style="{StaticResource HomeLinkButtonStyle}">
++                                Style="{StaticResource HomeLinkButtonStyle}" Command="{Binding SendRegisterCodeCommand}" IsEnabled="{Binding IsResendAvailable}">
+                             <TextBlock Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType={x:Type Button}}}"
+                                        FontSize="13"
+                                        FontWeight="Medium"
+@@ -915,7 +915,7 @@
+                             VerticalAlignment="Top"
+                             Orientation="Horizontal"
+                             MouseLeftButtonDown="RegisterAgreementRow_MouseLeftButtonDown">
+-                    <ToggleButton x:Name="RegisterAgreementCheckBox"
++                    <ToggleButton x:Name="RegisterAgreementCheckBox" IsChecked="{Binding AgreementAccepted, Mode=TwoWay}"
+                                   Margin="0,0,4,0"
+                                   Style="{StaticResource AuthAgreementCheckBoxStyle}" />
+                     <TextBlock FontSize="12"
+@@ -947,13 +947,14 @@
+                 <Button Height="39"
+                         Margin="6,402,-5,0"
+                         VerticalAlignment="Top"
+-                        AutomationProperties.Name="{DynamicResource AuthRegisterAction}"
++                        Command="{Binding RegisterCommand}" AutomationProperties.Name="{DynamicResource AuthRegisterAction}"
+                         Style="{StaticResource PrimaryActionRoundedButtonStyle}">
+                         <TextBlock Style="{StaticResource PrimaryActionButtonLabelStyle}"
+                                    Text="{DynamicResource AuthRegisterAction}" />
+                 </Button>
+             </Grid>
+         </Grid>
++            <Border VerticalAlignment="Bottom" Margin="20,0,20,6" Background="{DynamicResource SurfacePrimary}" Padding="4"><TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}" FontSize="12" /></Border>
+             <Button x:Name="ModalCloseButton" AutomationProperties.Name="关闭账号登录弹窗"
+                     Command="{Binding CloseCommand}" Style="{DynamicResource ModalCloseButtonStyle}" />
+         </Grid>
+diff --git a/src/FocusApp.Desktop/Views/AuthModal.xaml.cs b/src/FocusApp.Desktop/Views/AuthModal.xaml.cs
+index d86355c..ab45ac3 100644
+--- a/src/FocusApp.Desktop/Views/AuthModal.xaml.cs
++++ b/src/FocusApp.Desktop/Views/AuthModal.xaml.cs
+@@ -17,6 +17,20 @@ public partial class AuthModal : UserControl
+     public AuthModal()
+     {
+         InitializeComponent();
++        DataContextChanged += (_, args) =>
++        {
++            if (args.OldValue is AuthModalViewModel old) old.PasswordsCleared -= ClearPasswordInputs;
++            if (args.NewValue is AuthModalViewModel current) current.PasswordsCleared += ClearPasswordInputs;
++        };
++    }
++
++    private void ClearPasswordInputs(object? sender, EventArgs args)
++    {
++        LoginPasswordBox.Clear();
++        RegisterPasswordBox.Clear();
++        RegisterConfirmPasswordBox.Clear();
++        RecoveryNewPasswordBox.Clear();
++        RecoveryConfirmPasswordBox.Clear();
+     }
+ 
+     private void AuthCard_MouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+diff --git a/tests/FocusApp.Tests/Desktop/AuthModalViewModelTests.cs b/tests/FocusApp.Tests/Desktop/AuthModalViewModelTests.cs
+index 26f1586..65b430c 100644
+--- a/tests/FocusApp.Tests/Desktop/AuthModalViewModelTests.cs
++++ b/tests/FocusApp.Tests/Desktop/AuthModalViewModelTests.cs
+@@ -8,7 +8,7 @@ public sealed class AuthModalViewModelTests
+     [Fact]
+     public void AuthCommands_OpenSwitchAndCloseModal()
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+ 
+         viewModel.OpenLogin();
+         Assert.True(viewModel.IsOpen);
+@@ -27,7 +27,7 @@ public sealed class AuthModalViewModelTests
+     [Fact]
+     public void Login_WithFakeCredentials_SucceedsAndClosesModal()
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+         var loginSucceeded = false;
+         viewModel.LoginSucceeded += (_, _) => loginSucceeded = true;
+         viewModel.OpenLogin();
+@@ -47,7 +47,7 @@ public sealed class AuthModalViewModelTests
+     [InlineData("789", "789", MembershipType.Lifetime)]
+     public void Login_WithMembershipTestCredentials_ReturnsExpectedMembership(string account, string password, MembershipType expectedMembership)
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+         LoginSucceededEventArgs? result = null;
+         viewModel.LoginSucceeded += (_, args) => result = args;
+         viewModel.OpenLogin();
+@@ -57,7 +57,7 @@ public sealed class AuthModalViewModelTests
+         viewModel.LoginCommand.Execute(null);
+ 
+         Assert.NotNull(result);
+-        Assert.Equal(account, result!.Account);
++        Assert.Equal(account + "@focusapp.local", result!.Account);
+         Assert.Equal(expectedMembership, result.MembershipType);
+     }
+ 
+@@ -67,7 +67,7 @@ public sealed class AuthModalViewModelTests
+     [InlineData("", "")]
+     public void Login_WithInvalidCredentials_StaysOpenAndShowsError(string account, string password)
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+         var loginSucceeded = false;
+         viewModel.LoginSucceeded += (_, _) => loginSucceeded = true;
+         viewModel.OpenLogin();
+@@ -84,7 +84,7 @@ public sealed class AuthModalViewModelTests
+     [Fact]
+     public void PasswordRecovery_CompletesEntireInMemoryFlowAndReturnsToLogin()
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+         viewModel.OpenLogin();
+ 
+         viewModel.StartPasswordRecoveryCommand.Execute(null);
+@@ -98,7 +98,7 @@ public sealed class AuthModalViewModelTests
+         viewModel.ContinueRecoveryCommand.Execute(null);
+ 
+         Assert.True(viewModel.IsRecoveryVerificationStep);
+-        Assert.Equal(55, viewModel.ResendSecondsRemaining);
++        Assert.Equal(60, viewModel.ResendSecondsRemaining);
+         Assert.False(viewModel.CanVerifyRecoveryCode);
+ 
+         viewModel.RecoveryCode = "123456";
+@@ -108,11 +108,11 @@ public sealed class AuthModalViewModelTests
+         Assert.True(viewModel.IsRecoveryNewPasswordStep);
+         Assert.False(viewModel.CanCompletePasswordRecovery);
+ 
+-        viewModel.RecoveryNewPassword = "new-password";
++        viewModel.RecoveryNewPassword = "NewPassword123";
+         viewModel.RecoveryConfirmPassword = "different-password";
+         Assert.False(viewModel.CanCompletePasswordRecovery);
+ 
+-        viewModel.RecoveryConfirmPassword = "new-password";
++        viewModel.RecoveryConfirmPassword = "NewPassword123";
+         Assert.True(viewModel.CanCompletePasswordRecovery);
+         viewModel.CompletePasswordRecoveryCommand.Execute(null);
+ 
+@@ -131,7 +131,7 @@ public sealed class AuthModalViewModelTests
+     [Fact]
+     public void PasswordRecovery_BackCommandReturnsOneStepAtATime()
+     {
+-        var viewModel = new AuthModalViewModel();
++        var viewModel = new AuthModalViewModel(new FakeAccountClient());
+         viewModel.OpenLogin();
+         viewModel.StartPasswordRecoveryCommand.Execute(null);
+         viewModel.RecoveryAccount = "123";
+diff --git a/tests/FocusApp.Tests/Desktop/FocusThemePersistenceTests.cs b/tests/FocusApp.Tests/Desktop/FocusThemePersistenceTests.cs
+index e4e3402..624c531 100644
+--- a/tests/FocusApp.Tests/Desktop/FocusThemePersistenceTests.cs
++++ b/tests/FocusApp.Tests/Desktop/FocusThemePersistenceTests.cs
+@@ -135,7 +135,7 @@ public sealed class FocusThemePersistenceTests
+ 
+             MainWindowViewModel CreateWindowModel(SettingsPageViewModel config, FocusSessionViewModel focus)
+             {
+-                var model = new MainWindowViewModel(
++                var model = CreateMainWindow(
+                     [new(NavigationPage.Home, "首页", "")], new(NavigationPage.Account, "账户", ""),
+                     new HomePageViewModel([new("30分钟", "", true, 30)], focusSession: focus, focusTargetModal: new FocusTargetModalViewModel(false)),
+                     config, statisticsPage: new StatisticsOverviewViewModel(false), serviceConnection: connection);
+@@ -167,4 +167,14 @@ public sealed class FocusThemePersistenceTests
+             Thread.Sleep(2);
+         }
+     }
++    private static MainWindowViewModel CreateMainWindow(
++        IEnumerable<NavigationItemViewModel> primaryNavigationItems,
++        NavigationItemViewModel accountNavigationItem, HomePageViewModel homePage,
++        SettingsPageViewModel? settingsPage = null, BlockingPageViewModel? blockingPage = null,
++        StatisticsOverviewViewModel? statisticsPage = null,
++        FocusApp.Desktop.Services.DesktopServiceConnection? serviceConnection = null,
++        FocusApp.Desktop.Services.IAudioService? audioService = null,
++        BrowserExtensionModalViewModel? browserExtensionModal = null) =>
++        new(primaryNavigationItems, accountNavigationItem, homePage, settingsPage, blockingPage,
++            statisticsPage, serviceConnection, audioService, browserExtensionModal, new FakeAccountClient());
+ }
+diff --git a/tests/FocusApp.Tests/Desktop/MainWindowViewModelTests.cs b/tests/FocusApp.Tests/Desktop/MainWindowViewModelTests.cs
+index b4bf787..1d33932 100644
+--- a/tests/FocusApp.Tests/Desktop/MainWindowViewModelTests.cs
++++ b/tests/FocusApp.Tests/Desktop/MainWindowViewModelTests.cs
+@@ -15,7 +15,7 @@ public sealed class MainWindowViewModelTests
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var settings = new SettingsPageViewModel([], []);
+         var blocking = new BlockingPageViewModel([], [], "Websites {0}", "Applications {0}");
+-        _ = new MainWindowViewModel([home], account, homePage, settings, blocking);
++        _ = CreateMainWindow([home], account, homePage, settings, blocking);
+         blocking.WebsiteModal.Open();
+         blocking.WebsiteModal.WebsiteAddress = "abc";
+ 
+@@ -41,7 +41,7 @@ public sealed class MainWindowViewModelTests
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var forcedMode = new SettingsToggleItemViewModel("ForcedMode", "Forced", "Description", "Icon", false);
+         var settings = new SettingsPageViewModel([forcedMode], []);
+-        var viewModel = new MainWindowViewModel([home], account, homePage, settings,
++        var viewModel = CreateMainWindow([home], account, homePage, settings,
+             browserExtensionModal: new BrowserExtensionModalViewModel(new StubChromeExtensionService(), new StubChromeExtensionService()));
+ 
+         if (loginAccount is not null)
+@@ -77,7 +77,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var statistics = new NavigationItemViewModel(NavigationPage.Statistics, "Statistics", "S");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+-        var viewModel = new MainWindowViewModel([home, statistics], account, homePage,
++        var viewModel = CreateMainWindow([home, statistics], account, homePage,
+             statisticsPage: new StatisticsOverviewViewModel(false, localNowProvider: () => now));
+         var recordCount = viewModel.StatisticsPage.FocusSessionRecords.Count;
+ 
+@@ -112,7 +112,7 @@ public sealed class MainWindowViewModelTests
+             [new HomeDurationOptionViewModel("25 minutes", string.Empty, true, 25)]);
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+ 
+         viewModel.ShowCompletionReminderTest();
+ 
+@@ -130,7 +130,7 @@ public sealed class MainWindowViewModelTests
+             focusSession: session);
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         session.Start(30);
+         session.AdvancePreparationBy(TimeSpan.FromSeconds(5));
+         for (var index = 0; index < 12 * 60; index++) session.AdvanceOneSecond();
+@@ -153,7 +153,7 @@ public sealed class MainWindowViewModelTests
+             focusSession: session);
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         var recordCount = viewModel.StatisticsPage.FocusSessionRecords.Count;
+         var target = new FocusTargetViewModel("学习", ["任务一", "任务二"]);
+         session.Start(1, target);
+@@ -178,7 +178,7 @@ public sealed class MainWindowViewModelTests
+             focusSession: session);
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         session.Start(30);
+         session.AdvancePreparationBy(TimeSpan.FromSeconds(5));
+         session.AdvanceOneSecond();
+@@ -199,7 +199,7 @@ public sealed class MainWindowViewModelTests
+         var settings = new NavigationItemViewModel(NavigationPage.Settings, "Settings", "S");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home, settings], account, homePage);
++        var viewModel = CreateMainWindow([home, settings], account, homePage);
+ 
+         viewModel.NavigateCommand.Execute(settings);
+ 
+@@ -220,7 +220,7 @@ public sealed class MainWindowViewModelTests
+         var statistics = new NavigationItemViewModel(NavigationPage.Statistics, "Statistics", "S");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var statisticsPage = new StatisticsOverviewViewModel(useSampleData: false, deferInitialization: true);
+-        var viewModel = new MainWindowViewModel(
++        var viewModel = CreateMainWindow(
+             [home, statistics], account, homePage, statisticsPage: statisticsPage);
+         targetModal.Open();
+ 
+@@ -249,7 +249,7 @@ public sealed class MainWindowViewModelTests
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel(
+             [new HomeDurationOptionViewModel("25 minutes", string.Empty, true, 25)]);
+-        var viewModel = new MainWindowViewModel(
++        var viewModel = CreateMainWindow(
+             [homeNavigation, blockingNavigation], account, homePage);
+ 
+         homePage.OpenBlockedContentCommand.Execute(null);
+@@ -278,7 +278,7 @@ public sealed class MainWindowViewModelTests
+             Enum.GetNames<DayOfWeek>(), 540, 600);
+         settingsPage.AutomaticRules.Add(laterRule);
+         settingsPage.AutomaticRules.Add(nextRule);
+-        var viewModel = new MainWindowViewModel(
++        var viewModel = CreateMainWindow(
+             [homeNavigation, settingsNavigation], account, homePage, settingsPage);
+         homePage.UpdateAutomaticRules(
+             settingsPage.AutomaticRules,
+@@ -576,7 +576,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "123";
+         viewModel.AuthModal.LoginPassword = "123";
+@@ -599,7 +599,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "123";
+         viewModel.AuthModal.LoginPassword = "123";
+@@ -622,7 +622,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "123";
+         viewModel.AuthModal.LoginPassword = "123";
+@@ -642,7 +642,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var account = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], account, homePage);
++        var viewModel = CreateMainWindow([home], account, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "123";
+         viewModel.AuthModal.LoginPassword = "123";
+@@ -669,7 +669,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var accountNavigation = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], accountNavigation, homePage);
++        var viewModel = CreateMainWindow([home], accountNavigation, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = account;
+         viewModel.AuthModal.LoginPassword = password;
+@@ -702,7 +702,7 @@ public sealed class MainWindowViewModelTests
+         var home = new NavigationItemViewModel(NavigationPage.Home, "Home", "H");
+         var accountNavigation = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home], accountNavigation, homePage);
++        var viewModel = CreateMainWindow([home], accountNavigation, homePage);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "789";
+         viewModel.AuthModal.LoginPassword = "789";
+@@ -724,7 +724,7 @@ public sealed class MainWindowViewModelTests
+         var settings = new NavigationItemViewModel(NavigationPage.Settings, "Settings", "S");
+         var accountNavigation = new NavigationItemViewModel(NavigationPage.Account, "Account", "A");
+         var homePage = new HomePageViewModel([new HomeDurationOptionViewModel("25 minutes", string.Empty)]);
+-        var viewModel = new MainWindowViewModel([home, settings], accountNavigation, homePage);
++        var viewModel = CreateMainWindow([home, settings], accountNavigation, homePage);
+         viewModel.NavigateCommand.Execute(settings);
+         viewModel.OpenAuthCommand.Execute(null);
+         viewModel.AuthModal.LoginAccount = "789";
+@@ -755,4 +755,14 @@ public sealed class MainWindowViewModelTests
+         Assert.Empty(viewModel.AuthModal.RegisterPassword);
+         Assert.Empty(viewModel.AuthModal.RegisterConfirmPassword);
+     }
++    private static MainWindowViewModel CreateMainWindow(
++        IEnumerable<NavigationItemViewModel> primaryNavigationItems,
++        NavigationItemViewModel accountNavigationItem, HomePageViewModel homePage,
++        SettingsPageViewModel? settingsPage = null, BlockingPageViewModel? blockingPage = null,
++        StatisticsOverviewViewModel? statisticsPage = null,
++        FocusApp.Desktop.Services.DesktopServiceConnection? serviceConnection = null,
++        FocusApp.Desktop.Services.IAudioService? audioService = null,
++        BrowserExtensionModalViewModel? browserExtensionModal = null) =>
++        new(primaryNavigationItems, accountNavigationItem, homePage, settingsPage, blockingPage,
++            statisticsPage, serviceConnection, audioService, browserExtensionModal, new FakeAccountClient());
+ }
+diff --git a/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+@@ -0,0 +1,150 @@
++using System.Net;
++using System.Net.Http;
++using System.Net.Http.Headers;
++using System.Net.Http.Json;
++using System.Text.Json;
++
++namespace FocusApp.Desktop.Services.Cloud;
++
++public sealed class CloudAccountClient : IAccountClient
++{
++    private readonly HttpClient http;
++    private readonly ICredentialStore store;
++    private readonly SemaphoreSlim gate = new(1, 1);
++    private CredentialState? state;
++
++    public CloudAccountClient(HttpClient http, ICredentialStore store)
++    { this.http = http; this.store = store; }
++    public static CloudAccountClient CreateDefault()
++    {
++        var configured = Environment.GetEnvironmentVariable("FOCUSTIME_API_BASE_URL") ?? "http://localhost:5080/";
++        if (!Uri.TryCreate(configured, UriKind.Absolute, out var uri) ||
++            (uri.Scheme != "https" && !(uri.Scheme == "http" && uri.IsLoopback)) ||
++            !string.IsNullOrEmpty(uri.UserInfo) || uri.Query.Length > 0 || uri.Fragment.Length > 0)
++            throw new InvalidOperationException("FOCUSTIME_API_BASE_URL must use HTTPS or loopback HTTP.");
++        var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
++        { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(20) };
++        return new CloudAccountClient(http, new WindowsCredentialStore(uri));
++    }
++    private CredentialState State => state ??= store.Load();
++    private void Save(CredentialState updated) { store.Save(updated); state = updated; }
++
++    public Task<EmailChallenge> SendCodeAsync(string email, bool reset) => PostAsync<EmailChallenge>(
++        reset ? "password-reset/code" : "registration-code", new { email });
++    public async Task RegisterAsync(string email, Guid challengeId, string code, string password) =>
++        _ = await PostAsync<JsonElement>("register", new { email, challengeId, code, password });
++    public async Task<ResetTicket> VerifyResetAsync(Guid challengeId, string code)
++    {
++        var result = await PostAsync<JsonElement>("password-reset/verify", new { challengeId, code });
++        return new(result.GetProperty("resetTicket").GetString()!, result.GetProperty("expiresAtUtc").GetDateTimeOffset());
++    }
++    public async Task CompleteResetAsync(string ticket, string password) =>
++        await PostEmptyAsync("password-reset/complete", new { resetTicket = ticket, newPassword = password });
++
++    public async Task<CloudAccount> LoginAsync(string email, string password)
++    {
++        await gate.WaitAsync();
++        try
++        {
++            // Persist the installation identity before the first network request.
++            Save(State);
++            await DrainLogoutsAsync();
++            var tokens = await PostAsync<CloudTokens>("login", new { email, password,
++                device = new { State.InstallationId, name = Environment.MachineName,
++                    operatingSystem = "Windows", clientVersion = typeof(CloudAccountClient).Assembly.GetName().Version?.ToString() ?? "1.0" } });
++            var pending = new List<string>(State.PendingLogouts);
++            if (State.Tokens is { } old) pending.Add(old.RefreshToken);
++            Save(State with { Tokens = tokens, RefreshRequestId = null, PendingLogouts = pending });
++            await DrainLogoutsAsync();
++            return Account(tokens);
++        }
++        finally { gate.Release(); }
++    }
++
++    public async Task<CloudAccount?> RestoreAsync()
++    {
++        await gate.WaitAsync();
++        try
++        {
++            await DrainLogoutsAsync();
++            var tokens = State.Tokens;
++            if (tokens is null) return null;
++            if (tokens.RefreshTokenExpiresAtUtc <= DateTimeOffset.UtcNow)
++            { Save(State with { Tokens = null, RefreshRequestId = null }); return null; }
++            try
++            {
++                if (State.RefreshRequestId is not null || tokens.AccessTokenExpiresAtUtc <= DateTimeOffset.UtcNow.AddMinutes(1))
++                {
++                    // Keep the same request ID across timeouts and process restarts.
++                    Save(State with { RefreshRequestId = State.RefreshRequestId ?? Guid.NewGuid() });
++                    tokens = await PostAsync<CloudTokens>("refresh", new { tokens.RefreshToken, requestId = State.RefreshRequestId });
++                    Save(State with { Tokens = tokens, RefreshRequestId = null });
++                }
++                using var request = new HttpRequestMessage(HttpMethod.Get, "api/v1/auth/me");
++                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens.AccessToken);
++                using var response = await http.SendAsync(request);
++                await EnsureAsync(response);
++                var user = await response.Content.ReadFromJsonAsync<CloudProfile>() ?? throw new JsonException();
++                return new(user.Id, user.Email);
++            }
++            catch (CloudApiException ex) when (ex.Code is "authentication_required" or "invalid_session" or "refresh_reused")
++            { Save(State with { Tokens = null, RefreshRequestId = null }); return null; }
++            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
++            { return Account(tokens) with { IsOffline = true }; }
++        }
++        finally { gate.Release(); }
++    }
++
++    public async Task LogoutAsync()
++    {
++        await gate.WaitAsync();
++        try
++        {
++            var pending = new List<string>(State.PendingLogouts);
++            if (State.Tokens is { } tokens) pending.Add(tokens.RefreshToken);
++            // Clear the active credential durably before attempting network revocation.
++            Save(State with { Tokens = null, RefreshRequestId = null, PendingLogouts = pending });
++            await DrainLogoutsAsync();
++        }
++        finally { gate.Release(); }
++    }
++
++    private async Task DrainLogoutsAsync()
++    {
++        foreach (var token in State.PendingLogouts.ToArray())
++        {
++            try
++            {
++                await PostEmptyAsync("logout", new { refreshToken = token });
++                var pending = new List<string>(State.PendingLogouts);
++                pending.Remove(token);
++                Save(State with { PendingLogouts = pending });
++            }
++            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or CloudApiException) { break; }
++        }
++    }
++    private static CloudAccount Account(CloudTokens tokens) => new(tokens.User.Id, tokens.User.Email);
++    private async Task<T> PostAsync<T>(string path, object payload)
++    {
++        using var response = await http.PostAsJsonAsync("api/v1/auth/" + path, payload);
++        await EnsureAsync(response);
++        return await response.Content.ReadFromJsonAsync<T>() ?? throw new JsonException("Empty API response.");
++    }
++    private async Task PostEmptyAsync(string path, object payload)
++    {
++        using var response = await http.PostAsJsonAsync("api/v1/auth/" + path, payload);
++        await EnsureAsync(response);
++    }
++    private static async Task EnsureAsync(HttpResponseMessage response)
++    {
++        if (response.IsSuccessStatusCode) return;
++        var code = response.StatusCode == HttpStatusCode.Unauthorized ? "authentication_required" : "server_error";
++        try
++        {
++            var body = await response.Content.ReadFromJsonAsync<JsonElement>();
++            if (body.TryGetProperty("code", out var value)) code = value.GetString() ?? code;
++        }
++        catch (JsonException) { }
++        throw new CloudApiException(code);
++    }
++}
+diff --git a/src/FocusApp.Desktop/Services/Cloud/IAccountClient.cs b/src/FocusApp.Desktop/Services/Cloud/IAccountClient.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Desktop/Services/Cloud/IAccountClient.cs
+@@ -0,0 +1,24 @@
++using FocusApp.Desktop.ViewModels;
++
++namespace FocusApp.Desktop.Services.Cloud;
++
++public sealed record CloudAccount(Guid Id, string Email, bool IsOffline = false,
++    MembershipType Membership = MembershipType.Normal);
++public sealed record EmailChallenge(Guid ChallengeId, DateTimeOffset ExpiresAtUtc, int ResendAfterSeconds);
++public sealed record ResetTicket(string ResetTicketValue, DateTimeOffset ExpiresAtUtc);
++
++public interface IAccountClient
++{
++    Task<EmailChallenge> SendCodeAsync(string email, bool reset);
++    Task RegisterAsync(string email, Guid challengeId, string code, string password);
++    Task<CloudAccount> LoginAsync(string email, string password);
++    Task<CloudAccount?> RestoreAsync();
++    Task LogoutAsync();
++    Task<ResetTicket> VerifyResetAsync(Guid challengeId, string code);
++    Task CompleteResetAsync(string ticket, string password);
++}
++
++public sealed class CloudApiException(string code) : Exception(code)
++{
++    public string Code { get; } = code;
++}
+diff --git a/src/FocusApp.Desktop/Services/Cloud/WindowsCredentialStore.cs b/src/FocusApp.Desktop/Services/Cloud/WindowsCredentialStore.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Desktop/Services/Cloud/WindowsCredentialStore.cs
+@@ -0,0 +1,107 @@
++using System.ComponentModel;
++using System.IO;
++using System.Runtime.InteropServices;
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.Json;
++
++namespace FocusApp.Desktop.Services.Cloud;
++
++public interface ICredentialStore
++{
++    CredentialState Load();
++    void Save(CredentialState state);
++}
++
++public sealed record CredentialState(Guid InstallationId, CloudTokens? Tokens, Guid? RefreshRequestId,
++    List<string> PendingLogouts);
++public sealed record CloudProfile(Guid Id, string Email, bool EmailConfirmed);
++public sealed record CloudTokens(string TokenType, string AccessToken, DateTimeOffset AccessTokenExpiresAtUtc,
++    string RefreshToken, DateTimeOffset RefreshTokenExpiresAtUtc, Guid SessionId, Guid DeviceId, CloudProfile User);
++
++// DPAPI CurrentUser: only the signed-in Windows user can decrypt this file.
++// Bind ciphertext to the API origin so configuring another server cannot receive these credentials.
++public sealed class WindowsCredentialStore : ICredentialStore
++{
++    private readonly string path;
++    private readonly byte[] entropy;
++    public WindowsCredentialStore(Uri api, string? directory = null)
++    {
++        entropy = SHA256.HashData(Encoding.UTF8.GetBytes("FocusTime:accounts:v1:" + api.AbsoluteUri));
++        path = Path.Combine(directory ?? Path.Combine(Environment.GetFolderPath(
++            Environment.SpecialFolder.LocalApplicationData), "FocusApp", "Cloud"), Convert.ToHexString(entropy) + ".dpapi");
++    }
++    public CredentialState Load()
++    {
++        if (!File.Exists(path)) return Empty();
++        try
++        {
++            if (new FileInfo(path).Length > 1024 * 1024) return Empty();
++            return JsonSerializer.Deserialize<CredentialState>(Protect(File.ReadAllBytes(path), false)) ?? Empty();
++        }
++        catch (Exception ex) when (ex is IOException or JsonException or CryptographicException)
++        { return Empty(); }
++    }
++    public void Save(CredentialState state)
++    {
++        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
++        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
++        try
++        {
++            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
++                4096, FileOptions.WriteThrough))
++            {
++                var bytes = Protect(JsonSerializer.SerializeToUtf8Bytes(state), true);
++                file.Write(bytes);
++                file.Flush(true);
++            }
++            File.Move(temporary, path, true);
++        }
++        finally { if (File.Exists(temporary)) File.Delete(temporary); }
++    }
++    private static CredentialState Empty() => new(Guid.NewGuid(), null, null, []);
++    private byte[] Protect(byte[] input, bool encrypt)
++    {
++        var source = Blob.From(input);
++        var salt = Blob.From(entropy);
++        var output = new Blob();
++        try
++        {
++            var ok = encrypt ? CryptProtectData(ref source, null, ref salt, IntPtr.Zero, IntPtr.Zero, 1, out output)
++                : CryptUnprotectData(ref source, IntPtr.Zero, ref salt, IntPtr.Zero, IntPtr.Zero, 1, out output);
++            if (!ok) throw new CryptographicException(new Win32Exception(Marshal.GetLastWin32Error()).Message);
++            var result = new byte[output.Length];
++            Marshal.Copy(output.Data, result, 0, result.Length);
++            return result;
++        }
++        finally
++        {
++            Marshal.FreeHGlobal(source.Data);
++            Marshal.FreeHGlobal(salt.Data);
++            if (output.Data != IntPtr.Zero) LocalFree(output.Data);
++            CryptographicOperations.ZeroMemory(input);
++        }
++    }
++    [StructLayout(LayoutKind.Sequential)]
++    private struct Blob
++    {
++        public int Length;
++        public IntPtr Data;
++        public static Blob From(byte[] bytes)
++        {
++            var data = Marshal.AllocHGlobal(bytes.Length);
++            Marshal.Copy(bytes, 0, data, bytes.Length);
++            return new Blob { Length = bytes.Length, Data = data };
++        }
++    }
++    [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool CryptProtectData(ref Blob input, string? description, ref Blob entropy,
++        IntPtr reserved, IntPtr prompt, int flags, out Blob output);
++    [DllImport("crypt32.dll", SetLastError = true)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool CryptUnprotectData(ref Blob input, IntPtr description, ref Blob entropy,
++        IntPtr reserved, IntPtr prompt, int flags, out Blob output);
++    [DllImport("kernel32.dll")]
++    private static extern IntPtr LocalFree(IntPtr memory);
++}
+diff --git a/src/FocusApp.Desktop/ViewModels/AsyncCommand.cs b/src/FocusApp.Desktop/ViewModels/AsyncCommand.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Desktop/ViewModels/AsyncCommand.cs
+@@ -0,0 +1,19 @@
++using System.Windows.Input;
++
++namespace FocusApp.Desktop.ViewModels;
++
++public sealed class AsyncCommand(Func<Task> execute, Func<bool>? canExecute = null) : ICommand
++{
++    private bool running;
++    public event EventHandler? CanExecuteChanged;
++    public bool CanExecute(object? parameter) => !running && (canExecute?.Invoke() ?? true);
++    public async void Execute(object? parameter) => await ExecuteAsync();
++    public async Task ExecuteAsync()
++    {
++        if (!CanExecute(null)) return;
++        running = true;
++        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
++        try { await execute(); }
++        finally { running = false; CanExecuteChanged?.Invoke(this, EventArgs.Empty); }
++    }
++}
+diff --git a/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs b/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs
+@@ -0,0 +1,138 @@
++using System.IO;
++using System.Net;
++using System.Net.Http;
++using System.Net.Http.Json;
++using System.Text;
++using System.Text.Json;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Desktop.ViewModels;
++using Xunit;
++
++namespace FocusApp.Tests.Desktop;
++
++public sealed class CloudAccountClientTests
++{
++    private static CloudTokens Tokens() => new("Bearer", new string('A', 64), DateTimeOffset.UtcNow.AddMinutes(-1),
++        new string('B', 64), DateTimeOffset.UtcNow.AddDays(10), Guid.NewGuid(), Guid.NewGuid(),
++        new(Guid.NewGuid(), "person@example.test", true));
++
++    [Fact]
++    public async Task RefreshResponseLost_RestartUsesSameRequestId_AndConcurrentRestoresRotateOnce()
++    {
++        var store = new MemoryStore { State = new(Guid.NewGuid(), Tokens(), null, []) };
++        Guid? requestId = null;
++        var refreshed = Tokens() with { AccessToken = new string('C', 64), AccessTokenExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(15) };
++        var calls = 0;
++        var handler = new Handler(async request =>
++        {
++            if (request.RequestUri!.AbsolutePath.EndsWith("refresh"))
++            {
++                var body = await request.Content!.ReadFromJsonAsync<JsonElement>();
++                var id = body.GetProperty("requestId").GetGuid();
++                if (requestId is null) requestId = id;
++                Assert.Equal(requestId, id);
++                if (++calls == 1) throw new HttpRequestException("Simulated lost response");
++                return Json(refreshed);
++            }
++            Assert.Equal("Bearer", request.Headers.Authorization!.Scheme);
++            Assert.Equal(refreshed.AccessToken, request.Headers.Authorization.Parameter);
++            return Json(refreshed.User);
++        });
++        var first = new CloudAccountClient(Http(handler), store);
++        Assert.True((await first.RestoreAsync())!.IsOffline);
++        Assert.NotNull(store.State.RefreshRequestId);
++        var restarted = new CloudAccountClient(Http(handler), store);
++        var states = await Task.WhenAll(Enumerable.Range(0, 3).Select(_ => restarted.RestoreAsync()));
++        Assert.All(states, state => Assert.False(state!.IsOffline));
++        Assert.Equal(2, calls);
++        Assert.Null(store.State.RefreshRequestId);
++    }
++
++    [Fact]
++    public async Task OfflineLogout_ClearsActiveCredentialDurably_AndRetriesOnlyOldSession()
++    {
++        var tokens = Tokens();
++        var store = new MemoryStore { State = new(Guid.NewGuid(), tokens, null, []) };
++        var offline = true;
++        var handler = new Handler(async request =>
++        {
++            Assert.EndsWith("logout", request.RequestUri!.AbsolutePath);
++            Assert.Null(store.State.Tokens);
++            var body = await request.Content!.ReadFromJsonAsync<JsonElement>();
++            Assert.Equal(tokens.RefreshToken, body.GetProperty("refreshToken").GetString());
++            if (offline) throw new HttpRequestException("offline");
++            return new(HttpStatusCode.NoContent);
++        });
++        await new CloudAccountClient(Http(handler), store).LogoutAsync();
++        Assert.Null(store.State.Tokens);
++        Assert.Single(store.State.PendingLogouts);
++        offline = false;
++        Assert.Null(await new CloudAccountClient(Http(handler), store).RestoreAsync());
++        Assert.Empty(store.State.PendingLogouts);
++    }
++
++    [Fact]
++    public async Task RevokedCredential_ClearsLogin_AndDoesNotGrantMembership()
++    {
++        var store = new MemoryStore { State = new(Guid.NewGuid(), Tokens(), null, []) };
++        var client = new CloudAccountClient(Http(new Handler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
++            { Content = JsonContent.Create(new { code = "invalid_session" }) }))), store);
++        Assert.Null(await client.RestoreAsync());
++        Assert.Null(store.State.Tokens);
++    }
++
++    [Fact]
++    public void Dpapi_RoundTripsAcrossInstances_ContainsNoPlaintext_AndBindsApiOrigin()
++    {
++        var directory = Path.Combine(Path.GetTempPath(), "focustime-auth-test-" + Guid.NewGuid().ToString("N"));
++        Directory.CreateDirectory(directory);
++        try
++        {
++            var uri = new Uri("https://api.example.test/");
++            var state = new CredentialState(Guid.NewGuid(), Tokens(), Guid.NewGuid(), ["pending-secret"]);
++            new WindowsCredentialStore(uri, directory).Save(state);
++            var restored = new WindowsCredentialStore(uri, directory).Load();
++            Assert.Equal(state.Tokens, restored.Tokens);
++            Assert.Equal(state.InstallationId, restored.InstallationId);
++            var bytes = File.ReadAllBytes(Directory.GetFiles(directory).Single());
++            Assert.DoesNotContain(state.Tokens!.RefreshToken, Encoding.UTF8.GetString(bytes));
++            Assert.DoesNotContain("pending-secret", Encoding.UTF8.GetString(bytes));
++            var other = new WindowsCredentialStore(new Uri("https://another.example.test/"), directory);
++            Assert.Null(other.Load().Tokens);
++            File.WriteAllText(Directory.GetFiles(directory).Single(), "corrupt");
++            Assert.Null(new WindowsCredentialStore(uri, directory).Load().Tokens);
++        }
++        finally
++        {
++            foreach (var file in Directory.GetFiles(directory)) File.Delete(file);
++            Directory.Delete(directory);
++        }
++    }
++
++    [Fact]
++    public async Task ProductionClient_DoesNotAcceptLegacyFixtureCredentials_AndReportsNetworkFailure()
++    {
++        var store = new MemoryStore();
++        var client = new CloudAccountClient(Http(new Handler(_ => throw new HttpRequestException("offline"))), store);
++        var model = new AuthModalViewModel(client) { LoginAccount = "123", LoginPassword = "123" };
++        model.OpenLogin();
++        await ((AsyncCommand)model.LoginCommand).ExecuteAsync();
++        Assert.True(model.IsOpen);
++        Assert.True(model.HasLoginError);
++        Assert.Contains("无法连接", model.StatusMessage);
++        Assert.Null(store.State.Tokens);
++    }
++
++    internal sealed class MemoryStore : ICredentialStore
++    {
++        public CredentialState State { get; set; } = new(Guid.NewGuid(), null, null, []);
++        public CredentialState Load() => State;
++        public void Save(CredentialState state) => State = state;
++    }
++    private sealed class Handler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) : HttpMessageHandler
++    {
++        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request);
++    }
++    private static HttpClient Http(HttpMessageHandler handler) => new(handler) { BaseAddress = new("http://localhost:5080/") };
++    private static HttpResponseMessage Json<T>(T value) => new(HttpStatusCode.OK) { Content = JsonContent.Create(value) };
++}
+diff --git a/tests/FocusApp.Tests/Desktop/CloudAccountLiveTests.cs b/tests/FocusApp.Tests/Desktop/CloudAccountLiveTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/CloudAccountLiveTests.cs
+@@ -0,0 +1,98 @@
++using System.IO;
++using System.Net.Http;
++using System.Text;
++using System.Text.RegularExpressions;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Desktop.ViewModels;
++using Xunit;
++
++namespace FocusApp.Tests.Desktop;
++
++public sealed class LiveAccountFactAttribute : FactAttribute
++{
++    public LiveAccountFactAttribute()
++    {
++        if (Environment.GetEnvironmentVariable("FOCUSTIME_TEST_API") is null)
++            Skip = "Run the isolated backend account-client validation script.";
++    }
++}
++
++public sealed class CloudAccountLiveTests
++{
++    [LiveAccountFact]
++    public async Task ExistingAuthViewModel_RegistersLogsInRestoresAndResetsAgainstRealApi()
++    {
++        var uri = new Uri(Environment.GetEnvironmentVariable("FOCUSTIME_TEST_API")!);
++        var mailFolder = Environment.GetEnvironmentVariable("FOCUSTIME_TEST_MAIL")!;
++        var folder = Path.Combine(Path.GetTempPath(), "focustime-live-" + Guid.NewGuid().ToString("N"));
++        var email = "client-" + Guid.NewGuid().ToString("N") + "@example.test";
++        try
++        {
++            var store = new WindowsCredentialStore(uri, folder);
++            using var http = new HttpClient { BaseAddress = uri };
++            var model = new AuthModalViewModel(new CloudAccountClient(http, store));
++            model.OpenLogin();
++            model.ShowRegisterCommand.Execute(null);
++            model.RegisterEmail = email;
++            await ((AsyncCommand)model.SendRegisterCodeCommand).ExecuteAsync();
++            Assert.Contains("验证码已发送", model.StatusMessage);
++            model.RegisterCode = Code(mailFolder, email);
++            model.RegisterPassword = model.RegisterConfirmPassword = "ClientTest12345";
++            model.AgreementAccepted = true;
++            await ((AsyncCommand)model.RegisterCommand).ExecuteAsync();
++            Assert.Contains("注册成功", model.StatusMessage);
++            model.LoginPassword = "ClientTest12345";
++            LoginSucceededEventArgs? signedIn = null;
++            model.LoginSucceeded += (_, args) => signedIn = args;
++            await ((AsyncCommand)model.LoginCommand).ExecuteAsync();
++            Assert.NotNull(signedIn);
++            Assert.Equal(email, signedIn!.Account);
++            Assert.Equal(MembershipType.Normal, signedIn.MembershipType);
++            Assert.Empty(model.LoginPassword);
++            var restored = new CloudAccountClient(http, new WindowsCredentialStore(uri, folder));
++            Assert.Equal(email, (await restored.RestoreAsync())!.Email);
++            await restored.LogoutAsync();
++            Assert.Null(await restored.RestoreAsync());
++
++            await Task.Delay(TimeSpan.FromSeconds(61));
++            model.OpenLogin();
++            model.StartPasswordRecoveryCommand.Execute(null);
++            model.RecoveryAccount = email;
++            await ((AsyncCommand)model.ContinueRecoveryCommand).ExecuteAsync();
++            Assert.True(model.IsRecoveryVerificationStep);
++            model.RecoveryCode = Code(mailFolder, email);
++            await ((AsyncCommand)model.VerifyRecoveryCodeCommand).ExecuteAsync();
++            Assert.True(model.IsRecoveryNewPasswordStep);
++            model.RecoveryNewPassword = model.RecoveryConfirmPassword = "ResetClient12345";
++            await ((AsyncCommand)model.CompletePasswordRecoveryCommand).ExecuteAsync();
++            Assert.True(model.IsRecoveryCompletedStep);
++            model.ReturnToLoginCommand.Execute(null);
++            model.LoginAccount = email;
++            model.LoginPassword = "ResetClient12345";
++            signedIn = null;
++            await ((AsyncCommand)model.LoginCommand).ExecuteAsync();
++            Assert.NotNull(signedIn);
++            await model.LogoutAsync();
++        }
++        finally
++        {
++            if (Directory.Exists(folder))
++            { foreach (var file in Directory.GetFiles(folder)) File.Delete(file); Directory.Delete(folder); }
++        }
++    }
++    private static string Code(string directory, string email)
++    {
++        foreach (var file in Directory.GetFiles(directory, "*.eml").OrderByDescending(File.GetLastWriteTimeUtc))
++        {
++            var text = File.ReadAllText(file);
++            if (!text.Contains(email, StringComparison.OrdinalIgnoreCase)) continue;
++            var boundary = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
++            var body = text[(boundary + 4)..].Trim();
++            if (text[..boundary].Contains("base64", StringComparison.OrdinalIgnoreCase))
++                body = Encoding.UTF8.GetString(Convert.FromBase64String(body));
++            var match = Regex.Match(body, "[0-9]{6}");
++            if (match.Success) return match.Value;
++        }
++        throw new InvalidOperationException("Development pickup mail was not found.");
++    }
++}
+diff --git a/tests/FocusApp.Tests/Desktop/FakeAccountClient.cs b/tests/FocusApp.Tests/Desktop/FakeAccountClient.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/FakeAccountClient.cs
+@@ -0,0 +1,28 @@
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Desktop.ViewModels;
++
++namespace FocusApp.Tests.Desktop;
++
++// Only UI regression tests use these legacy presentation fixtures.
++internal sealed class FakeAccountClient : IAccountClient
++{
++    public Task<CloudAccount> LoginAsync(string email, string password)
++    {
++        var membership = (email, password) switch
++        {
++            ("123", "123") => MembershipType.Normal,
++            ("456", "456") => MembershipType.Annual,
++            ("789", "789") => MembershipType.Lifetime,
++            _ => throw new CloudApiException("invalid_credentials")
++        };
++        return Task.FromResult(new CloudAccount(Guid.NewGuid(), email + "@focusapp.local", false, membership));
++    }
++    public Task<EmailChallenge> SendCodeAsync(string email, bool reset) =>
++        Task.FromResult(new EmailChallenge(Guid.NewGuid(), DateTimeOffset.UtcNow.AddMinutes(10), 60));
++    public Task RegisterAsync(string email, Guid challengeId, string code, string password) => Task.CompletedTask;
++    public Task<ResetTicket> VerifyResetAsync(Guid challengeId, string code) =>
++        Task.FromResult(new ResetTicket("test-only", DateTimeOffset.UtcNow.AddMinutes(10)));
++    public Task CompleteResetAsync(string ticket, string password) => Task.CompletedTask;
++    public Task<CloudAccount?> RestoreAsync() => Task.FromResult<CloudAccount?>(null);
++    public Task LogoutAsync() => Task.CompletedTask;
++}

@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: focustime
+      POSTGRES_USER: focustime
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U focustime -d focustime"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build: .
+    volumes:
+      - api_development_data:/app/.artifacts
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Database: Host=db;Port=5432;Database=focustime;Username=focustime;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env};Timeout=3;Command Timeout=5
+    ports:
+      - "127.0.0.1:5080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  postgres_data:
+  api_development_data:

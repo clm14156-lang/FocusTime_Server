@@ -1,0 +1,957 @@
+diff --git a/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+index 7d6a91b..7dcbc2b 100644
+--- a/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
++++ b/src/FocusApp.Desktop/Services/Cloud/CloudAccountClient.cs
+@@ -6,12 +6,13 @@ using System.Text.Json;
+ 
+ namespace FocusApp.Desktop.Services.Cloud;
+ 
+-public sealed class CloudAccountClient : IAccountClient
++public sealed class CloudAccountClient : IAccountClient, IDeviceSessionClient
+ {
+     private readonly HttpClient http;
+     private readonly ICredentialStore store;
+     private readonly SemaphoreSlim gate = new(1, 1);
+     private CredentialState? state;
++    public event EventHandler? SessionEnded;
+ 
+     public CloudAccountClient(HttpClient http, ICredentialStore store)
+     { this.http = http; this.store = store; }
+@@ -69,26 +70,15 @@ public sealed class CloudAccountClient : IAccountClient
+             await DrainLogoutsAsync();
+             var tokens = State.Tokens;
+             if (tokens is null) return null;
+-            if (tokens.RefreshTokenExpiresAtUtc <= DateTimeOffset.UtcNow)
+-            { Save(State with { Tokens = null, RefreshRequestId = null }); return null; }
+             try
+             {
+-                if (State.RefreshRequestId is not null || tokens.AccessTokenExpiresAtUtc <= DateTimeOffset.UtcNow.AddMinutes(1))
+-                {
+-                    // Keep the same request ID across timeouts and process restarts.
+-                    Save(State with { RefreshRequestId = State.RefreshRequestId ?? Guid.NewGuid() });
+-                    tokens = await PostAsync<CloudTokens>("refresh", new { tokens.RefreshToken, requestId = State.RefreshRequestId });
+-                    Save(State with { Tokens = tokens, RefreshRequestId = null });
+-                }
+-                using var request = new HttpRequestMessage(HttpMethod.Get, "api/v1/auth/me");
+-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens.AccessToken);
+-                using var response = await http.SendAsync(request);
+-                await EnsureAsync(response);
++                tokens = await EnsureTokensAsync();
++                using var response = await SendAuthorizedAsync(HttpMethod.Get, "api/v1/auth/me");
+                 var user = await response.Content.ReadFromJsonAsync<CloudProfile>() ?? throw new JsonException();
+                 return new(user.Id, user.Email);
+             }
+             catch (CloudApiException ex) when (ex.Code is "authentication_required" or "invalid_session" or "refresh_reused")
+-            { Save(State with { Tokens = null, RefreshRequestId = null }); return null; }
++            { EndSession(); return null; }
+             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+             { return Account(tokens) with { IsOffline = true }; }
+         }
+@@ -109,6 +99,84 @@ public sealed class CloudAccountClient : IAccountClient
+         finally { gate.Release(); }
+     }
+ 
++    private static bool IsInvalidSession(CloudApiException error) =>
++        error.Code is "authentication_required" or "invalid_session" or "refresh_reused";
++
++    private void EndSession()
++    {
++        var hadSession = State.Tokens is not null;
++        Save(State with { Tokens = null, RefreshRequestId = null });
++        if (hadSession) SessionEnded?.Invoke(this, EventArgs.Empty);
++    }
++
++    private async Task<CloudTokens> EnsureTokensAsync(bool forceRefresh = false)
++    {
++        var tokens = State.Tokens ?? throw new CloudApiException("authentication_required");
++        if (tokens.RefreshTokenExpiresAtUtc <= DateTimeOffset.UtcNow)
++            throw new CloudApiException("invalid_session");
++        if (forceRefresh || State.RefreshRequestId is not null || tokens.AccessTokenExpiresAtUtc <= DateTimeOffset.UtcNow.AddMinutes(1))
++        {
++            Save(State with { RefreshRequestId = State.RefreshRequestId ?? Guid.NewGuid() });
++            var payload = new { tokens.RefreshToken, requestId = State.RefreshRequestId };
++            try { tokens = await PostAsync<CloudTokens>("refresh", payload); }
++            catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
++            {
++                // Retry once within the server's recovery window, without changing the persisted ID.
++                await Task.Delay(250);
++                tokens = await PostAsync<CloudTokens>("refresh", payload);
++            }
++            Save(State with { Tokens = tokens, RefreshRequestId = null });
++        }
++        return tokens;
++    }
++
++    public async Task<IReadOnlyList<CloudDevice>> GetDevicesAsync()
++    {
++        await gate.WaitAsync();
++        try
++        {
++            using var response = await SendAuthorizedAsync(HttpMethod.Get, "api/v1/me/devices");
++            return await response.Content.ReadFromJsonAsync<List<CloudDevice>>() ?? throw new JsonException();
++        }
++        finally { gate.Release(); }
++    }
++    public Task RevokeDeviceAsync(Guid deviceId) => RevokeAsync(HttpMethod.Delete,
++        "api/v1/me/devices/" + deviceId + "/sessions", deviceId, null, false);
++    public Task RevokeSessionAsync(Guid sessionId) => RevokeAsync(HttpMethod.Delete,
++        "api/v1/me/sessions/" + sessionId, null, sessionId, false);
++    public Task LogoutAllAsync() => RevokeAsync(HttpMethod.Post, "api/v1/auth/logout-all", null, null, true);
++
++    private async Task RevokeAsync(HttpMethod method, string path, Guid? deviceId, Guid? sessionId, bool all)
++    {
++        await gate.WaitAsync();
++        try
++        {
++            using var response = await SendAuthorizedAsync(method, path);
++            if (all || State.Tokens?.DeviceId == deviceId || State.Tokens?.SessionId == sessionId) EndSession();
++        }
++        finally { gate.Release(); }
++    }
++    private async Task<HttpResponseMessage> SendAuthorizedAsync(HttpMethod method, string path)
++    {
++        try
++        {
++            for (var attempt = 0; attempt < 2; attempt++)
++            {
++                var tokens = await EnsureTokensAsync(forceRefresh: attempt == 1);
++                using var request = new HttpRequestMessage(method, path);
++                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens.AccessToken);
++                var response = await http.SendAsync(request);
++                if (response.StatusCode == HttpStatusCode.Unauthorized && attempt == 0)
++                { response.Dispose(); continue; }
++                try { await EnsureAsync(response); return response; }
++                catch { response.Dispose(); throw; }
++            }
++            throw new CloudApiException("invalid_session");
++        }
++        catch (CloudApiException error) when (IsInvalidSession(error))
++        { EndSession(); throw; }
++    }
++
+     private async Task DrainLogoutsAsync()
+     {
+         foreach (var token in State.PendingLogouts.ToArray())
+diff --git a/src/FocusApp.Desktop/ViewModels/AccountSyncModalViewModel.cs b/src/FocusApp.Desktop/ViewModels/AccountSyncModalViewModel.cs
+index cbf91f3..f3ca389 100644
+--- a/src/FocusApp.Desktop/ViewModels/AccountSyncModalViewModel.cs
++++ b/src/FocusApp.Desktop/ViewModels/AccountSyncModalViewModel.cs
+@@ -1,3 +1,6 @@
++using System.Collections.ObjectModel;
++using System.Net.Http;
++using FocusApp.Desktop.Services.Cloud;
+ using System.ComponentModel;
+ using System.Runtime.CompilerServices;
+ using System.Windows.Input;
+@@ -28,10 +31,21 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+     private bool _isAccountDeletionActive;
+     private string _accountDeletionConfirmation = string.Empty;
+     private bool _isDeviceLogoutConfirmationActive;
+-    private bool _isMacBookProLoggedIn = true;
+-
+-    public AccountSyncModalViewModel()
+-    {
++    private readonly IDeviceSessionClient? _devicesClient;
++    private bool _isBusy;
++    private string _deviceStatus = "";
++    private CloudDevice? _pendingDevice;
++    private CloudSession? _pendingSession;
++    private bool _pendingAll;
++    private int _deviceGeneration;
++
++    public AccountSyncModalViewModel(IDeviceSessionClient? devicesClient = null)
++    {
++        _devicesClient = devicesClient;
++        if (_devicesClient is not null) _devicesClient.SessionEnded += (_, _) => { ClearDevices(); Close(); };
++        RefreshDevicesCommand = new AsyncCommand(() => RunDevicesAsync(RefreshDevicesCoreAsync));
++        OpenSessionLogoutConfirmationCommand = new RelayCommand<CloudSession>(OpenSessionLogoutConfirmation);
++        OpenLogoutAllConfirmationCommand = new RelayCommand<object>(_ => OpenLogoutAllConfirmation());
+         CloseCommand = new RelayCommand<object>(_ => Close());
+         NavigateSectionCommand = new RelayCommand<string>(SelectSection);
+         OpenPasswordChangeCommand = new RelayCommand<object>(_ => OpenPasswordChange());
+@@ -42,9 +56,9 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+         OpenAccountDeletionCommand = new RelayCommand<object>(_ => OpenAccountDeletion());
+         ReturnFromAccountDeletionCommand = new RelayCommand<object>(_ => ReturnFromAccountDeletion());
+         ConfirmAccountDeletionCommand = new RelayCommand<object>(_ => ConfirmAccountDeletion());
+-        OpenDeviceLogoutConfirmationCommand = new RelayCommand<object>(_ => OpenDeviceLogoutConfirmation());
++        OpenDeviceLogoutConfirmationCommand = new RelayCommand<CloudDevice>(OpenDeviceLogoutConfirmation);
+         ReturnFromDeviceLogoutConfirmationCommand = new RelayCommand<object>(_ => ReturnFromDeviceLogoutConfirmation());
+-        ConfirmDeviceLogoutCommand = new RelayCommand<object>(_ => ConfirmDeviceLogout());
++        ConfirmDeviceLogoutCommand = new AsyncCommand(() => RunDevicesAsync(ConfirmDeviceLogoutAsync));
+     }
+ 
+     public event PropertyChangedEventHandler? PropertyChanged;
+@@ -139,11 +153,20 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+         }
+     }
+ 
+-    public bool IsMacBookProLoggedIn
+-    {
+-        get => _isMacBookProLoggedIn;
+-        private set => SetField(ref _isMacBookProLoggedIn, value);
+-    }
++    public ObservableCollection<CloudDevice> Devices { get; } = [];
++    public ICommand RefreshDevicesCommand { get; }
++    public ICommand OpenSessionLogoutConfirmationCommand { get; }
++    public ICommand OpenLogoutAllConfirmationCommand { get; }
++    public bool IsBusy { get => _isBusy; private set { SetField(ref _isBusy, value); OnPropertyChanged(nameof(IsDeviceIdle)); OnPropertyChanged(nameof(HasNoDevices)); } }
++    public bool IsDeviceIdle => !IsBusy;
++    public bool HasNoDevices => !IsBusy && Devices.Count == 0;
++    public string DevicesCount => $"{Devices.Count} 台已登录设备";
++    public string DeviceStatus { get => _deviceStatus; private set => SetField(ref _deviceStatus, value); }
++    public string PendingLogoutName => _pendingAll ? "全部设备" : _pendingDevice?.Name ?? _pendingSession?.Label ?? "";
++    public string PendingLogoutQuestion => _pendingAll ? "退出全部设备？" : _pendingDevice is not null ? "退出所选设备？" : "退出所选会话？";
++    public string PendingLogoutDescription => _pendingAll ? "所有设备（包括当前设备）都需要重新登录。专注记录会保留。"
++        : _pendingDevice is not null ? "该设备的所有登录会话将退出。专注记录会保留。"
++        : "此登录会话将退出，其他会话保持有效。专注记录会保留。";
+ 
+     public bool IsTransientContentActive =>
+         IsPasswordChangeActive || IsAccountDeletionActive || IsDeviceLogoutConfirmationActive;
+@@ -246,6 +269,7 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+         ResetTransientContent();
+         SelectedSectionKey = CloudSection;
+         IsOpen = true;
++        RefreshDevicesCommand.Execute(null);
+     }
+ 
+     public void SelectSection(string? sectionKey)
+@@ -314,33 +338,93 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+         AccountDeletionConfirmed?.Invoke(this, EventArgs.Empty);
+     }
+ 
+-    private void OpenDeviceLogoutConfirmation()
++    private void OpenDeviceLogoutConfirmation(CloudDevice? device)
++    {
++        if (device is null || IsBusy) return;
++        ResetTransientContent();
++        _pendingDevice = device;
++        ShowDeviceConfirmation();
++    }
++    private void OpenSessionLogoutConfirmation(CloudSession? session)
++    {
++        if (session is null || IsBusy) return;
++        ResetTransientContent();
++        _pendingSession = session;
++        ShowDeviceConfirmation();
++    }
++    private void OpenLogoutAllConfirmation()
++    {
++        if (IsBusy || Devices.Count == 0) return;
++        ResetTransientContent();
++        _pendingAll = true;
++        ShowDeviceConfirmation();
++    }
++    private void ShowDeviceConfirmation()
+     {
+-        if (!IsMacBookProLoggedIn)
+-        {
+-            return;
+-        }
+-
+-        ResetPasswordChange();
+-        ResetAccountDeletion();
+         SelectedSectionKey = DevicesSection;
++        foreach (var name in new[] { nameof(PendingLogoutName), nameof(PendingLogoutQuestion), nameof(PendingLogoutDescription) }) OnPropertyChanged(name);
+         IsDeviceLogoutConfirmationActive = true;
+     }
+-
+     private void ReturnFromDeviceLogoutConfirmation()
+     {
++        if (!IsBusy) ResetDeviceLogoutConfirmation();
++    }
++    private async Task ConfirmDeviceLogoutAsync()
++    {
++        if (!IsDeviceLogoutConfirmationActive) return;
++        var client = _devicesClient ?? throw new CloudApiException("authentication_required");
++        if (_pendingAll) await client.LogoutAllAsync();
++        else if (_pendingDevice is { } device) await client.RevokeDeviceAsync(device.Id);
++        else if (_pendingSession is { } session) await client.RevokeSessionAsync(session.Id);
++        else return;
+         ResetDeviceLogoutConfirmation();
++        if (IsOpen) { await RefreshDevicesCoreAsync(); DeviceStatus = "已退出选定的登录会话。"; }
+     }
+-
+-    private void ConfirmDeviceLogout()
++    private async Task RefreshDevicesCoreAsync()
+     {
+-        if (!IsDeviceLogoutConfirmationActive || !IsMacBookProLoggedIn)
++        var generation = _deviceGeneration;
++        var items = await (_devicesClient ?? throw new CloudApiException("authentication_required")).GetDevicesAsync();
++        if (generation != _deviceGeneration) return;
++        Devices.Clear();
++        foreach (var item in items) Devices.Add(item);
++        NotifyDevicesChanged();
++        DeviceStatus = "设备列表已更新。";
++    }
++    private async Task RunDevicesAsync(Func<Task> action)
++    {
++        if (IsBusy) return;
++        IsBusy = true;
++        DeviceStatus = "正在连接服务器…";
++        try { await action(); }
++        catch (CloudApiException error)
+         {
+-            return;
++            DeviceStatus = error.Code switch
++            {
++                "authentication_required" or "invalid_session" or "refresh_reused" => "登录已失效，请重新登录。",
++                "not_found" => "该设备或会话已不存在，请刷新列表。",
++                "rate_limit_exceeded" => "操作过于频繁，请稍后重试。",
++                _ => "操作未完成，请稍后重试。"
++            };
+         }
+-
+-        IsMacBookProLoggedIn = false;
++        catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
++        { DeviceStatus = "无法连接服务器，退出操作尚未确认，请联网后重试。"; }
++        catch (Exception error) when (error is System.IO.IOException or System.UnauthorizedAccessException or
++            System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException)
++        { DeviceStatus = "无法读取账号状态或服务器响应，请稍后重试。"; }
++        finally { IsBusy = false; }
++    }
++    public void ClearDevices()
++    {
++        _deviceGeneration++;
++        DeviceStatus = "";
++        Devices.Clear();
+         ResetDeviceLogoutConfirmation();
++        NotifyDevicesChanged();
++    }
++    private void NotifyDevicesChanged()
++    {
++        OnPropertyChanged(nameof(DevicesCount));
++        OnPropertyChanged(nameof(HasNoDevices));
+     }
+ 
+     private void Close()
+@@ -373,6 +457,9 @@ public sealed class AccountSyncModalViewModel : INotifyPropertyChanged
+     private void ResetDeviceLogoutConfirmation()
+     {
+         IsDeviceLogoutConfirmationActive = false;
++        _pendingDevice = null;
++        _pendingSession = null;
++        _pendingAll = false;
+     }
+ 
+     private void NotifyPasswordValidationChanged()
+diff --git a/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs b/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
+index 179d3db..e5bef6a 100644
+--- a/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
++++ b/src/FocusApp.Desktop/ViewModels/AuthModalViewModel.cs
+@@ -39,6 +39,13 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+     public AuthModalViewModel(IAccountClient? accounts = null)
+     {
+         _accounts = accounts ?? CloudAccountClient.CreateDefault();
++        if (_accounts is IDeviceSessionClient devices)
++            devices.SessionEnded += (_, _) =>
++            {
++                SessionStatus = "登录已失效";
++                StatusMessage = "当前登录已退出或失效，请重新登录。";
++                SessionCleared?.Invoke(this, EventArgs.Empty);
++            };
+         RegisterCommand = new AsyncCommand(() => RunAsync(RegisterAsync));
+         SendRegisterCodeCommand = new AsyncCommand(() => RunAsync(SendRegisterCodeAsync));
+         CloseCommand = new RelayCommand<object>(_ => Close());
+@@ -498,6 +505,8 @@ public sealed class AuthModalViewModel : INotifyPropertyChanged
+                 "invalid_reset_ticket" => "重置凭证已过期，请重新找回密码。",
+                 "account_locked" => "登录失败次数过多，请在 15 分钟后重试。",
+                 "email_rate_limited" or "rate_limit_exceeded" => "操作过于频繁，请稍后再试。",
++                "session_limit_reached" => "登录会话已达上限，请先退出已有设备或会话。",
++                "authentication_required" or "invalid_session" or "refresh_reused" => "登录已失效，请重新登录。",
+                 "email_unavailable" => "邮件服务暂不可用，请稍后再试。",
+                 "validation_failed" or "invalid_device" => "请检查邮箱、验证码和密码格式。",
+                 _ => "请求未完成，请稍后重试。"
+diff --git a/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs b/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
+index 1966ee7..93903c5 100644
+--- a/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
++++ b/src/FocusApp.Desktop/ViewModels/MainWindowViewModel.cs
+@@ -137,7 +137,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+             Interval = TimeSpan.FromSeconds(3)
+         };
+         _focusResultToastTimer.Tick += (_, _) => CloseFocusResultToast();
+-        AuthModal = new AuthModalViewModel(accountClient);
++        var accounts = accountClient ?? CloudAccountClient.CreateDefault();
++        AccountSyncModal = new AccountSyncModalViewModel(accounts as IDeviceSessionClient);
++        AuthModal = new AuthModalViewModel(accounts);
+         AuthModal.LoginSucceeded += AuthModal_LoginSucceeded;
+         AuthModal.SessionCleared += (_, _) => ClearAccountSession();
+         // Only the real application owns the periodic cloud session maintenance.
+@@ -182,7 +184,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+ 
+     public AuthModalViewModel AuthModal { get; }
+ 
+-    public AccountSyncModalViewModel AccountSyncModal { get; } = new();
++    public AccountSyncModalViewModel AccountSyncModal { get; }
+ 
+     public VipModalViewModel VipModal { get; } = new();
+     public BrowserExtensionModalViewModel BrowserExtensionModal { get; }
+@@ -434,6 +436,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+     private void AuthModal_LoginSucceeded(object? sender, LoginSucceededEventArgs e)
+     {
+         if (IsLoggedIn && _currentAccount == e.Account && MembershipType == e.MembershipType) return;
++        AccountSyncModal.ClearDevices();
+         _currentAccount = e.Account;
+         MembershipType = e.MembershipType;
+         OnPropertyChanged(nameof(CurrentUserEmail));
+@@ -496,6 +499,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
+             AuthModal.ClearAccountForm();
+         }
+ 
++        AccountSyncModal.ClearDevices();
+         _currentAccount = string.Empty;
+         MembershipType = MembershipType.Normal;
+         OnPropertyChanged(nameof(CurrentUserEmail));
+diff --git a/src/FocusApp.Desktop/Views/AccountSyncModal.xaml b/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
+index 087c6b7..1795426 100644
+--- a/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
++++ b/src/FocusApp.Desktop/Views/AccountSyncModal.xaml
+@@ -334,95 +334,52 @@
+ 
+                         <StackPanel x:Name="DevicesSectionAnchor" Margin="0,24,0,0">
+                             <StackPanel Orientation="Horizontal">
+-                                <Border Width="34" Height="34" Background="#EDF3FB" CornerRadius="17">
+-                                    <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="{DynamicResource TextSecondary}" Text="&#xE7F8;" />
+-                                </Border>
+-                                <TextBlock Margin="11,0,0,0" VerticalAlignment="Center" FontSize="15" FontWeight="Medium" Text="{DynamicResource AccountSyncDevicesTitle}" />
+-                                <Border Height="22" Margin="12,0,0,0" Padding="9,0" VerticalAlignment="Center" Background="{DynamicResource BackgroundSecondary}" CornerRadius="7">
+-                                    <TextBlock VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource TextSecondary}">
+-                                        <TextBlock.Style>
+-                                            <Style TargetType="{x:Type TextBlock}">
+-                                                <Setter Property="Text" Value="{DynamicResource AccountSyncDevicesCount}" />
+-                                                <Style.Triggers>
+-                                                    <DataTrigger Binding="{Binding IsMacBookProLoggedIn}" Value="False">
+-                                                        <Setter Property="Text" Value="{DynamicResource AccountSyncDevicesCountAfterLogout}" />
+-                                                    </DataTrigger>
+-                                                </Style.Triggers>
+-                                            </Style>
+-                                        </TextBlock.Style>
+-                                    </TextBlock>
+-                                </Border>
++                                <TextBlock VerticalAlignment="Center" FontSize="15" FontWeight="Medium" Text="{DynamicResource AccountSyncDevicesTitle}" />
++                                <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource TextSecondary}" Text="{Binding DevicesCount}" />
+                             </StackPanel>
+-                            <Border Margin="0,11,0,0">
+-                                <Border.Style>
+-                                    <Style TargetType="{x:Type Border}" BasedOn="{StaticResource AccountSyncCard}">
+-                                        <Setter Property="Height" Value="104" />
+-                                        <Style.Triggers>
+-                                            <DataTrigger Binding="{Binding IsMacBookProLoggedIn}" Value="False">
+-                                                <Setter Property="Height" Value="52" />
+-                                            </DataTrigger>
+-                                        </Style.Triggers>
+-                                    </Style>
+-                                </Border.Style>
+-                                <Grid>
+-                                    <Grid Margin="14,0" Visibility="{Binding IsMacBookProLoggedIn, Converter={StaticResource BooleanToVisibilityConverter}}">
+-                                        <Grid.RowDefinitions><RowDefinition /><RowDefinition Height="1" /><RowDefinition /></Grid.RowDefinitions>
+-                                        <Grid>
+-                                            <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="{DynamicResource TextSecondary}" Text="&#xE7F8;" />
+-                                            <StackPanel Margin="34,0,0,0" VerticalAlignment="Center">
+-                                                <StackPanel Orientation="Horizontal">
+-                                                    <TextBlock FontSize="13" FontWeight="Medium" Text="{DynamicResource AccountSyncCurrentDevice}" />
+-                                                    <Border Height="21" Margin="9,0,0,0" Padding="8,0" Background="{DynamicResource AccentTint}" CornerRadius="7">
+-                                                        <TextBlock VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource AccentPrimary}" Text="{DynamicResource AccountSyncCurrentDeviceTag}" />
+-                                                    </Border>
+-                                                </StackPanel>
+-                                                <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="{DynamicResource TextSecondary}" Text="{DynamicResource AccountSyncCurrentDeviceMeta}" />
+-                                            </StackPanel>
+-                                        </Grid>
+-                                        <Border Grid.Row="1" Background="{DynamicResource BorderPrimary}" />
+-                                        <Grid Grid.Row="2">
+-                                            <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="{DynamicResource TextSecondary}" Text="&#xE7F8;" />
+-                                            <StackPanel Margin="34,0,72,0" VerticalAlignment="Center">
+-                                                <TextBlock FontSize="13" FontWeight="Medium" Text="{DynamicResource AccountSyncOtherDevice}" />
+-                                                <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="{DynamicResource TextSecondary}" Text="{DynamicResource AccountSyncOtherDeviceMeta}" />
+-                                            </StackPanel>
+-                                            <Button Width="64"
+-                                                    Height="32"
+-                                                    HorizontalAlignment="Right"
+-                                                    Command="{Binding OpenDeviceLogoutConfirmationCommand}"
+-                                                    Style="{StaticResource AccountSyncPlainButton}">
+-                                                <StackPanel HorizontalAlignment="Center" Orientation="Horizontal">
+-                                                    <TextBlock VerticalAlignment="Center" FontSize="12" Text="{DynamicResource AccountSyncDeviceLogout}" />
+-                                                    <TextBlock Margin="7,0,0,0" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Text="&#xE76C;" />
+-                                                </StackPanel>
+-                                            </Button>
+-                                        </Grid>
+-                                    </Grid>
+-
+-                                    <Grid Margin="14,0">
+-                                        <Grid.Style>
+-                                            <Style TargetType="{x:Type Grid}">
+-                                                <Setter Property="Visibility" Value="Collapsed" />
+-                                                <Style.Triggers>
+-                                                    <DataTrigger Binding="{Binding IsMacBookProLoggedIn}" Value="False">
+-                                                        <Setter Property="Visibility" Value="Visible" />
+-                                                    </DataTrigger>
+-                                                </Style.Triggers>
+-                                            </Style>
+-                                        </Grid.Style>
+-                                        <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="{DynamicResource TextSecondary}" Text="&#xE7F8;" />
+-                                        <StackPanel Margin="34,0,0,0" VerticalAlignment="Center">
+-                                            <StackPanel Orientation="Horizontal">
+-                                                <TextBlock FontSize="13" FontWeight="Medium" Text="{DynamicResource AccountSyncCurrentDevice}" />
+-                                                <Border Height="21" Margin="9,0,0,0" Padding="8,0" Background="{DynamicResource AccentTint}" CornerRadius="7">
+-                                                    <TextBlock VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource AccentPrimary}" Text="{DynamicResource AccountSyncCurrentDeviceTag}" />
+-                                                </Border>
++                            <StackPanel Orientation="Horizontal" Margin="0,10,0,8" IsEnabled="{Binding IsDeviceIdle}">
++                                <Button Content="刷新设备" Padding="12,6" Command="{Binding RefreshDevicesCommand}" Style="{StaticResource AccountSyncPlainButton}" />
++                                <Button Content="退出全部设备" Padding="12,6" Margin="10,0,0,0" Command="{Binding OpenLogoutAllConfirmationCommand}" Style="{StaticResource AccountSyncPlainButton}" />
++                            </StackPanel>
++                            <TextBlock Text="{Binding DeviceStatus}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}" />
++                            <TextBlock Text="暂无已登录设备，请登录后刷新。" Margin="0,10,0,0" FontSize="12" Visibility="{Binding HasNoDevices, Converter={StaticResource BooleanToVisibilityConverter}}" />
++                            <ItemsControl ItemsSource="{Binding Devices}" IsEnabled="{Binding IsDeviceIdle}">
++                                <ItemsControl.ItemTemplate>
++                                    <DataTemplate>
++                                        <Border Margin="0,10,0,0" Padding="12" Style="{StaticResource AccountSyncCard}">
++                                            <StackPanel>
++                                                <DockPanel>
++                                                    <Button DockPanel.Dock="Right" Content="退出此设备" Padding="8,4"
++                                                        Command="{Binding DataContext.OpenDeviceLogoutConfirmationCommand, RelativeSource={RelativeSource AncestorType={x:Type UserControl}}}" CommandParameter="{Binding}" Style="{StaticResource AccountSyncPlainButton}" />
++                                                    <StackPanel>
++                                                        <StackPanel Orientation="Horizontal">
++                                                            <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="Medium" MaxWidth="190" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" />
++                                                            <TextBlock Text="当前设备" FontSize="12" Margin="8,0,0,0" Foreground="{DynamicResource AccentPrimary}" Visibility="{Binding IsCurrentDevice, Converter={StaticResource BooleanToVisibilityConverter}}" />
++                                                        </StackPanel>
++                                                        <TextBlock Text="{Binding Metadata}" Margin="0,5,8,0" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}" />
++                                                    </StackPanel>
++                                                </DockPanel>
++                                                <Expander Header="{Binding SessionCount}" Margin="0,8,0,0" FontSize="12">
++                                                    <ItemsControl ItemsSource="{Binding Sessions}">
++                                                        <ItemsControl.ItemTemplate>
++                                                            <DataTemplate>
++                                                                <DockPanel Margin="0,6,0,0">
++                                                                    <Button DockPanel.Dock="Right" Content="退出会话" Padding="8,4" Style="{StaticResource AccountSyncPlainButton}"
++                                                                        Command="{Binding DataContext.OpenSessionLogoutConfirmationCommand, RelativeSource={RelativeSource AncestorType={x:Type UserControl}}}" CommandParameter="{Binding}" />
++                                                                    <StackPanel>
++                                                                        <TextBlock Text="{Binding Label}" FontSize="12" />
++                                                                        <TextBlock Text="{Binding Activity}" FontSize="12" Foreground="{DynamicResource TextSecondary}" />
++                                                                    </StackPanel>
++                                                                </DockPanel>
++                                                            </DataTemplate>
++                                                        </ItemsControl.ItemTemplate>
++                                                    </ItemsControl>
++                                                </Expander>
+                                             </StackPanel>
+-                                            <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="{DynamicResource TextSecondary}" Text="{DynamicResource AccountSyncCurrentDeviceMeta}" />
+-                                        </StackPanel>
+-                                    </Grid>
+-                                </Grid>
+-                            </Border>
++                                        </Border>
++                                    </DataTemplate>
++                                </ItemsControl.ItemTemplate>
++                            </ItemsControl>
+                         </StackPanel>
+ 
+                         <StackPanel x:Name="SecuritySectionAnchor" Margin="0,24,0,0">
+@@ -790,6 +747,7 @@
+ 
+                 <Grid Margin="28,18,17,16"
+                       Visibility="{Binding IsDeviceLogoutConfirmationActive, Converter={StaticResource BooleanToVisibilityConverter}}">
++                    <TextBlock Text="{Binding DeviceStatus}" Margin="0,350,0,0" VerticalAlignment="Top" FontSize="12" TextWrapping="Wrap" />
+                     <Button Width="66"
+                             Height="30"
+                             HorizontalAlignment="Left"
+@@ -820,7 +778,7 @@
+                                VerticalAlignment="Top"
+                                FontSize="17"
+                                FontWeight="SemiBold"
+-                               Text="{DynamicResource AccountDeviceLogoutQuestion}"
++                               Text="{Binding PendingLogoutQuestion}"
+                                TextAlignment="Center" />
+ 
+                     <TextBlock Width="408"
+@@ -829,7 +787,7 @@
+                                VerticalAlignment="Top"
+                                FontSize="13"
+                                FontWeight="Normal"
+-                               Text="{DynamicResource AccountDeviceLogoutDescription}"
++                               Text="{Binding PendingLogoutDescription}"
+                                TextAlignment="Center" />
+                     <TextBlock Width="408"
+                                Margin="0,201,0,0"
+@@ -838,7 +796,7 @@
+                                FontSize="13"
+                                FontWeight="Normal"
+                                Foreground="{DynamicResource TextTertiary}"
+-                               Text="{DynamicResource AccountDeviceLogoutCloudHint}"
++                               Text="离线设备将在重新联网时退出"
+                                TextAlignment="Center" />
+ 
+                     <Border Width="284"
+@@ -854,8 +812,8 @@
+                             </Grid.ColumnDefinitions>
+                             <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="30" Foreground="{DynamicResource TextPrimary}" Text="&#xE7F8;" />
+                             <StackPanel Grid.Column="1" VerticalAlignment="Center">
+-                                <TextBlock FontSize="15" FontWeight="Medium" Text="{DynamicResource AccountSyncOtherDevice}" />
+-                                <TextBlock Margin="0,5,0,0" FontSize="13" FontWeight="Normal" Foreground="{DynamicResource TextSecondary}" Text="{DynamicResource AccountDeviceLogoutMeta}" />
++                                <TextBlock FontSize="15" FontWeight="Medium" Text="{Binding PendingLogoutName}" />
++                                <TextBlock Margin="0,5,0,0" FontSize="13" FontWeight="Normal" Foreground="{DynamicResource TextSecondary}" Text="会话退出后需要重新登录" />
+                             </StackPanel>
+                         </Grid>
+                     </Border>
+@@ -885,7 +843,7 @@
+                             Margin="211,304,0,0"
+                             HorizontalAlignment="Left"
+                             VerticalAlignment="Top"
+-                            Command="{Binding ConfirmDeviceLogoutCommand}"
++                            Command="{Binding ConfirmDeviceLogoutCommand}" IsEnabled="{Binding IsDeviceIdle}"
+                             Style="{StaticResource AccountDeletionDangerButtonStyle}"
+                             Content="{DynamicResource AccountDeviceLogoutConfirm}" />
+                 </Grid>
+diff --git a/tests/FocusApp.Tests/Desktop/AccountSyncModalViewModelTests.cs b/tests/FocusApp.Tests/Desktop/AccountSyncModalViewModelTests.cs
+index e253bcc..fd162ec 100644
+--- a/tests/FocusApp.Tests/Desktop/AccountSyncModalViewModelTests.cs
++++ b/tests/FocusApp.Tests/Desktop/AccountSyncModalViewModelTests.cs
+@@ -157,40 +157,29 @@ public sealed class AccountSyncModalViewModelTests
+     }
+ 
+     [Fact]
+-    public void DeviceLogout_CancelReturnsToDeviceListWithoutRemovingDevice()
++    public void DeviceLogout_CancelReturnsToListWithoutRevocation()
+     {
+-        var viewModel = new AccountSyncModalViewModel();
+-
+-        viewModel.OpenDeviceLogoutConfirmationCommand.Execute(null);
+-
+-        Assert.True(viewModel.IsDeviceLogoutConfirmationActive);
+-        Assert.True(viewModel.IsTransientContentActive);
+-        Assert.Equal(AccountSyncModalViewModel.DevicesSection, viewModel.SelectedSectionKey);
+-
+-        viewModel.ReturnFromDeviceLogoutConfirmationCommand.Execute(null);
+-
+-        Assert.False(viewModel.IsDeviceLogoutConfirmationActive);
+-        Assert.False(viewModel.IsTransientContentActive);
+-        Assert.True(viewModel.IsMacBookProLoggedIn);
+-        Assert.Equal(AccountSyncModalViewModel.DevicesSection, viewModel.SelectedSectionKey);
++        var client = new FakeDeviceSessionClient();
++        var model = new AccountSyncModalViewModel(client);
++        model.Open();
++        model.OpenDeviceLogoutConfirmationCommand.Execute(model.Devices[0]);
++        Assert.True(model.IsDeviceLogoutConfirmationActive);
++        model.ReturnFromDeviceLogoutConfirmationCommand.Execute(null);
++        Assert.False(model.IsDeviceLogoutConfirmationActive);
++        Assert.Single(model.Devices);
++        Assert.Equal(0, client.Revocations);
+     }
+-
+     [Fact]
+-    public void DeviceLogout_ConfirmRemovesDeviceAndRefreshesListState()
++    public async Task DeviceLogout_ConfirmCallsApiAndReloadsList()
+     {
+-        var viewModel = new AccountSyncModalViewModel();
+-        viewModel.Open();
+-        viewModel.OpenDeviceLogoutConfirmationCommand.Execute(null);
+-
+-        viewModel.ConfirmDeviceLogoutCommand.Execute(null);
+-
+-        Assert.False(viewModel.IsDeviceLogoutConfirmationActive);
+-        Assert.False(viewModel.IsMacBookProLoggedIn);
+-        Assert.Equal(AccountSyncModalViewModel.DevicesSection, viewModel.SelectedSectionKey);
+-        Assert.True(viewModel.IsOpen);
+-
+-        viewModel.OpenDeviceLogoutConfirmationCommand.Execute(null);
+-
+-        Assert.False(viewModel.IsDeviceLogoutConfirmationActive);
++        var client = new FakeDeviceSessionClient();
++        var model = new AccountSyncModalViewModel(client);
++        model.Open();
++        model.OpenDeviceLogoutConfirmationCommand.Execute(model.Devices[0]);
++        await ((AsyncCommand)model.ConfirmDeviceLogoutCommand).ExecuteAsync();
++        Assert.Equal(1, client.Revocations);
++        Assert.Empty(model.Devices);
++        Assert.False(model.IsDeviceLogoutConfirmationActive);
++        Assert.True(model.IsOpen);
+     }
+ }
+diff --git a/tests/FocusApp.Tests/Desktop/AccountSyncTypographyPresentationTests.cs b/tests/FocusApp.Tests/Desktop/AccountSyncTypographyPresentationTests.cs
+index ab4eef5..320ba11 100644
+--- a/tests/FocusApp.Tests/Desktop/AccountSyncTypographyPresentationTests.cs
++++ b/tests/FocusApp.Tests/Desktop/AccountSyncTypographyPresentationTests.cs
+@@ -53,9 +53,9 @@ public sealed class AccountSyncTypographyPresentationTests
+         Assert.Equal(fontWeight, (string?)element.Attribute("FontWeight"));
+     }
+ 
+-    private static string FindRepositoryRoot()
++    private static string FindRepositoryRoot([System.Runtime.CompilerServices.CallerFilePath] string sourceFile = "")
+     {
+-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
++        var directory = new DirectoryInfo(Path.GetDirectoryName(sourceFile)!);
+         while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "FocusApp.sln")))
+         {
+             directory = directory.Parent;
+diff --git a/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs b/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs
+index e3f3284..0b7cac0 100644
+--- a/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs
++++ b/tests/FocusApp.Tests/Desktop/CloudAccountClientTests.cs
+@@ -31,7 +31,7 @@ public sealed class CloudAccountClientTests
+                 var id = body.GetProperty("requestId").GetGuid();
+                 if (requestId is null) requestId = id;
+                 Assert.Equal(requestId, id);
+-                if (++calls == 1) throw new HttpRequestException("Simulated lost response");
++                if (++calls <= 2) throw new HttpRequestException("Simulated lost response");
+                 return Json(refreshed);
+             }
+             Assert.Equal("Bearer", request.Headers.Authorization!.Scheme);
+@@ -44,7 +44,7 @@ public sealed class CloudAccountClientTests
+         var restarted = new CloudAccountClient(Http(handler), store);
+         var states = await Task.WhenAll(Enumerable.Range(0, 3).Select(_ => restarted.RestoreAsync()));
+         Assert.All(states, state => Assert.False(state!.IsOffline));
+-        Assert.Equal(2, calls);
++        Assert.Equal(3, calls);
+         Assert.Null(store.State.RefreshRequestId);
+     }
+ 
+diff --git a/src/FocusApp.Desktop/Services/Cloud/IDeviceSessionClient.cs b/src/FocusApp.Desktop/Services/Cloud/IDeviceSessionClient.cs
+new file mode 100644
+--- /dev/null
++++ b/src/FocusApp.Desktop/Services/Cloud/IDeviceSessionClient.cs
+@@ -0,0 +1,23 @@
++namespace FocusApp.Desktop.Services.Cloud;
++
++public sealed record CloudSession(Guid Id, DateTimeOffset CreatedAtUtc, DateTimeOffset LastSeenAtUtc,
++    DateTimeOffset ExpiresAtUtc, bool IsCurrentSession)
++{
++    public string Label => IsCurrentSession ? "当前会话" : "其他登录会话";
++    public string Activity => $"最近活动：{LastSeenAtUtc.ToLocalTime():yyyy-MM-dd HH:mm}";
++}
++public sealed record CloudDevice(Guid Id, string Name, string OperatingSystem, string ClientVersion,
++    DateTimeOffset FirstSeenAtUtc, DateTimeOffset LastSeenAtUtc, bool IsCurrentDevice,
++    IReadOnlyList<CloudSession> Sessions)
++{
++    public string Metadata => $"{OperatingSystem} · {ClientVersion} · 最近活动 {LastSeenAtUtc.ToLocalTime():yyyy-MM-dd HH:mm}";
++    public string SessionCount => $"登录会话（{Sessions.Count}）";
++}
++public interface IDeviceSessionClient
++{
++    event EventHandler? SessionEnded;
++    Task<IReadOnlyList<CloudDevice>> GetDevicesAsync();
++    Task RevokeDeviceAsync(Guid deviceId);
++    Task RevokeSessionAsync(Guid sessionId);
++    Task LogoutAllAsync();
++}
+diff --git a/tests/FocusApp.Tests/Desktop/CloudDeviceClientTests.cs b/tests/FocusApp.Tests/Desktop/CloudDeviceClientTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/CloudDeviceClientTests.cs
+@@ -0,0 +1,135 @@
++using System.Net;
++using System.Net.Http;
++using System.Net.Http.Json;
++using System.Text.Json;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Desktop.ViewModels;
++using Xunit;
++
++namespace FocusApp.Tests.Desktop;
++
++public sealed class CloudDeviceClientTests
++{
++    private static CloudTokens Tokens() => new("Bearer", new string('A',64), DateTimeOffset.UtcNow.AddMinutes(15),
++        new string('B',64), DateTimeOffset.UtcNow.AddDays(30), Guid.NewGuid(), Guid.NewGuid(), new(Guid.NewGuid(), "user@example.test", true));
++    private static CloudAccountClient Client(CloudAccountClientTests.MemoryStore store,
++        Func<HttpRequestMessage, Task<HttpResponseMessage>> send) => new(new HttpClient(new Handler(send))
++        { BaseAddress = new("http://localhost:5080/") }, store);
++    private sealed class Handler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) : HttpMessageHandler
++    {
++        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) => send(request);
++    }
++
++    [Fact]
++    public async Task RevokeOtherDevice_PreservesCurrentCredentials_ThenRevokeCurrentSessionClearsThem()
++    {
++        var tokens = Tokens(); var store = new CloudAccountClientTests.MemoryStore { State = new(Guid.NewGuid(),tokens,null,[]) };
++        var other = Guid.NewGuid(); var paths = new List<string>();
++        var client = Client(store, request =>
++        {
++            Assert.Equal(tokens.AccessToken, request.Headers.Authorization!.Parameter);
++            paths.Add(request.RequestUri!.AbsolutePath);
++            Assert.Equal(HttpMethod.Delete, request.Method);
++            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
++        });
++        var ended = 0; client.SessionEnded += (_,_) => ended++;
++        await client.RevokeDeviceAsync(other);
++        Assert.NotNull(store.State.Tokens); Assert.Equal(0, ended);
++        await client.RevokeSessionAsync(tokens.SessionId);
++        Assert.Null(store.State.Tokens); Assert.Equal(1, ended);
++        Assert.Equal(new[] { $"/api/v1/me/devices/{other}/sessions", $"/api/v1/me/sessions/{tokens.SessionId}" }, paths);
++    }
++
++    [Fact]
++    public async Task ServerRevocation_ClearsStoredSession_AndNotifiesAuthViewModel()
++    {
++        var store = new CloudAccountClientTests.MemoryStore { State = new(Guid.NewGuid(),Tokens(),null,[]) };
++        var client = Client(store, _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
++            { Content = JsonContent.Create(new { code = "invalid_session" }) }));
++        var auth = new AuthModalViewModel(client); var ended = false;
++        auth.SessionCleared += (_,_) => ended = true;
++        await Assert.ThrowsAsync<CloudApiException>(() => client.GetDevicesAsync());
++        Assert.True(ended); Assert.Null(store.State.Tokens);
++        Assert.Contains("重新登录", auth.StatusMessage);
++    }
++
++    [Fact]
++    public async Task NetworkFailure_DoesNotClearCredentialsOrPretendDeviceWasRemoved()
++    {
++        var tokens = Tokens(); var store = new CloudAccountClientTests.MemoryStore { State = new(Guid.NewGuid(),tokens,null,[]) };
++        var device = new CloudDevice(Guid.NewGuid(),"Other PC","Windows","3",DateTimeOffset.UtcNow,DateTimeOffset.UtcNow,false,[]);
++        var client = Client(store, request => request.Method == HttpMethod.Get ? Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
++            { Content = JsonContent.Create(new[] { device }) }) : throw new HttpRequestException("Offline"));
++        var panel = new AccountSyncModalViewModel(client);
++        panel.Open();
++        await Wait(() => !panel.IsBusy);
++        panel.OpenDeviceLogoutConfirmationCommand.Execute(panel.Devices[0]);
++        await ((AsyncCommand)panel.ConfirmDeviceLogoutCommand).ExecuteAsync();
++        Assert.Single(panel.Devices); Assert.True(panel.IsDeviceLogoutConfirmationActive);
++        Assert.Contains("尚未确认", panel.DeviceStatus); Assert.NotNull(store.State.Tokens);
++    }
++
++    [Fact]
++    public async Task UnauthorizedAccessWithClockSkew_RefreshesBeforeRetryingDeviceRequest()
++    {
++        var old = Tokens(); var rotated = old with { AccessToken = new string('C',64) };
++        var store = new CloudAccountClientTests.MemoryStore { State = new(Guid.NewGuid(),old,null,[]) };
++        var refreshes = 0; var reads = 0;
++        var client = Client(store, async request =>
++        {
++            if (request.RequestUri!.AbsolutePath.EndsWith("refresh"))
++            {
++                refreshes++; var body = await request.Content!.ReadFromJsonAsync<JsonElement>();
++                Assert.Equal(old.RefreshToken, body.GetProperty("refreshToken").GetString());
++                Assert.NotEqual(Guid.Empty, body.GetProperty("requestId").GetGuid());
++                return new(HttpStatusCode.OK) { Content = JsonContent.Create(rotated) };
++            }
++            reads++;
++            return reads == 1 ? new(HttpStatusCode.Unauthorized) : new(HttpStatusCode.OK) { Content = JsonContent.Create(Array.Empty<CloudDevice>()) };
++        });
++        Assert.Empty(await client.GetDevicesAsync());
++        Assert.Equal(1,refreshes); Assert.Equal(2,reads); Assert.Equal(rotated,store.State.Tokens);
++    }
++
++    [Fact]
++    public async Task LogoutAll_UsesProtectedEndpoint_AndClearsCurrentSession()
++    {
++        var store = new CloudAccountClientTests.MemoryStore { State = new(Guid.NewGuid(),Tokens(),null,[]) };
++        var client = Client(store, request =>
++        {
++            Assert.Equal(HttpMethod.Post,request.Method); Assert.EndsWith("/auth/logout-all",request.RequestUri!.AbsolutePath);
++            Assert.NotNull(request.Headers.Authorization);
++            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
++        });
++        await client.LogoutAllAsync(); Assert.Null(store.State.Tokens);
++    }
++
++    internal static async Task Wait(Func<bool> predicate)
++    {
++        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
++        while (!predicate()) await Task.Delay(10,timeout.Token);
++    }
++
++    [Fact]
++    public async Task AccountClearedWhileListIsInFlight_DropsTheOldAccountResponse()
++    {
++        var client = new DelayedDevices();
++        var panel = new AccountSyncModalViewModel(client);
++        panel.Open(); Assert.True(panel.IsBusy);
++        panel.ClearDevices();
++        client.Reply.SetResult([new(Guid.NewGuid(),"Previous account PC","Windows","3",DateTimeOffset.UtcNow,
++            DateTimeOffset.UtcNow,false,[])]);
++        await Wait(() => !panel.IsBusy);
++        Assert.Empty(panel.Devices);
++    }
++
++    private sealed class DelayedDevices : IDeviceSessionClient
++    {
++        public event EventHandler? SessionEnded { add { } remove { } }
++        public TaskCompletionSource<IReadOnlyList<CloudDevice>> Reply { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public Task<IReadOnlyList<CloudDevice>> GetDevicesAsync() => Reply.Task;
++        public Task RevokeDeviceAsync(Guid id) => Task.CompletedTask;
++        public Task RevokeSessionAsync(Guid id) => Task.CompletedTask;
++        public Task LogoutAllAsync() => Task.CompletedTask;
++    }
++}
+diff --git a/tests/FocusApp.Tests/Desktop/CloudDeviceLiveTests.cs b/tests/FocusApp.Tests/Desktop/CloudDeviceLiveTests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/CloudDeviceLiveTests.cs
+@@ -0,0 +1,58 @@
++using System.IO;
++using System.Net.Http;
++using System.Text;
++using System.Text.RegularExpressions;
++using FocusApp.Desktop.Services.Cloud;
++using FocusApp.Desktop.ViewModels;
++using Xunit;
++
++namespace FocusApp.Tests.Desktop;
++
++public sealed class CloudDeviceLiveTests
++{
++    [LiveAccountFact]
++    public async Task TwoInstallations_ListRemoteLogout_ReLoginAndLogoutAll_ThroughRealApiAndDeviceViewModel()
++    {
++        var uri = new Uri(Environment.GetEnvironmentVariable("FOCUSTIME_TEST_API")!);
++        var mail = Environment.GetEnvironmentVariable("FOCUSTIME_TEST_MAIL")!;
++        var folder = Path.Combine(Path.GetTempPath(),"focustime-devices-"+Guid.NewGuid().ToString("N"));
++        var email = "devices-"+Guid.NewGuid().ToString("N")+"@example.test";
++        Directory.CreateDirectory(folder);
++        try
++        {
++            using var httpA = new HttpClient { BaseAddress = uri }; using var httpB = new HttpClient { BaseAddress = uri };
++            var storeA = new WindowsCredentialStore(uri,Path.Combine(folder,"a"));
++            var storeB = new WindowsCredentialStore(uri,Path.Combine(folder,"b"));
++            var a = new CloudAccountClient(httpA,storeA); var b = new CloudAccountClient(httpB,storeB);
++            var challenge = await a.SendCodeAsync(email,false);
++            var message = Directory.GetFiles(mail,"*.eml").Select(File.ReadAllText).Single(x=>x.Contains(email,StringComparison.OrdinalIgnoreCase));
++            var headerEnd = message.IndexOf("\r\n\r\n",StringComparison.Ordinal); var body = message[(headerEnd+4)..].Trim();
++            if(message[..headerEnd].Contains("base64",StringComparison.OrdinalIgnoreCase)) body=Encoding.UTF8.GetString(Convert.FromBase64String(body));
++            await a.RegisterAsync(email,challenge.ChallengeId,Regex.Match(body,"[0-9]{6}").Value,"DeviceClient123");
++            await a.LoginAsync(email,"DeviceClient123"); await b.LoginAsync(email,"DeviceClient123");
++            Assert.NotEqual(storeA.Load().InstallationId,storeB.Load().InstallationId);
++            var authB = new AuthModalViewModel(b); var expiredB = false; authB.SessionCleared += (_,_)=>expiredB=true;
++            var panel = new AccountSyncModalViewModel(a); panel.Open(); await CloudDeviceClientTests.Wait(()=>!panel.IsBusy);
++            Assert.Equal(2,panel.Devices.Count); Assert.Single(panel.Devices,x=>x.IsCurrentDevice);
++            var remote = panel.Devices.Single(x=>!x.IsCurrentDevice);
++            panel.OpenDeviceLogoutConfirmationCommand.Execute(remote);
++            Assert.Contains(remote.Name,panel.PendingLogoutName);
++            await ((AsyncCommand)panel.ConfirmDeviceLogoutCommand).ExecuteAsync();
++            Assert.Single(panel.Devices); Assert.Null(await b.RestoreAsync()); Assert.True(expiredB);
++            Assert.Null(storeB.Load().Tokens); Assert.NotNull(await a.RestoreAsync());
++            await b.LoginAsync(email,"DeviceClient123");
++            Assert.Equal(remote.Id,(await a.GetDevicesAsync()).Single(x=>!x.IsCurrentDevice).Id);
++            await ((AsyncCommand)panel.RefreshDevicesCommand).ExecuteAsync();
++            panel.OpenLogoutAllConfirmationCommand.Execute(null);
++            await ((AsyncCommand)panel.ConfirmDeviceLogoutCommand).ExecuteAsync();
++            Assert.Null(storeA.Load().Tokens); Assert.False(panel.IsOpen); Assert.Null(await b.RestoreAsync());
++        }
++        finally
++        {
++            // Only remove files in the randomly generated test directories, without recursion.
++            foreach(var dir in new[]{Path.Combine(folder,"a"),Path.Combine(folder,"b")})
++                if(Directory.Exists(dir)){foreach(var file in Directory.GetFiles(dir))File.Delete(file);Directory.Delete(dir);}
++            Directory.Delete(folder);
++        }
++    }
++}
+diff --git a/tests/FocusApp.Tests/Desktop/FakeDeviceSessionClient.cs b/tests/FocusApp.Tests/Desktop/FakeDeviceSessionClient.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/FocusApp.Tests/Desktop/FakeDeviceSessionClient.cs
+@@ -0,0 +1,16 @@
++using FocusApp.Desktop.Services.Cloud;
++
++namespace FocusApp.Tests.Desktop;
++
++internal sealed class FakeDeviceSessionClient : IDeviceSessionClient
++{
++    public event EventHandler? SessionEnded;
++    public int Revocations { get; private set; }
++    public List<CloudDevice> Devices { get; } = [new(Guid.NewGuid(), "Test PC", "Windows", "3.0",
++        DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, false, [new(Guid.NewGuid(), DateTimeOffset.UtcNow,
++            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddDays(30), false)])];
++    public Task<IReadOnlyList<CloudDevice>> GetDevicesAsync() => Task.FromResult<IReadOnlyList<CloudDevice>>(Devices.ToArray());
++    public Task RevokeDeviceAsync(Guid deviceId) { Revocations++; Devices.RemoveAll(x => x.Id == deviceId); return Task.CompletedTask; }
++    public Task RevokeSessionAsync(Guid sessionId) { Revocations++; Devices.Clear(); return Task.CompletedTask; }
++    public Task LogoutAllAsync() { Revocations++; Devices.Clear(); SessionEnded?.Invoke(this, EventArgs.Empty); return Task.CompletedTask; }
++}

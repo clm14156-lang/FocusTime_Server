@@ -1,0 +1,64 @@
+name: Backend validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-test-password
+          POSTGRES_DB: focustime_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d focustime_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      TEST_DATABASE_CONNECTION: Host=127.0.0.1;Port=5432;Database=postgres;Username=postgres;Password=ci-only-test-password
+      ConnectionStrings__Database: Host=127.0.0.1;Port=5432;Database=focustime_ci;Username=postgres;Password=ci-only-test-password
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - name: Record Linux environment
+        shell: bash
+        run: |
+          mkdir -p .artifacts
+          uname -a > .artifacts/linux-environment.txt
+          dotnet --info >> .artifacts/linux-environment.txt
+          docker version >> .artifacts/linux-environment.txt
+          git rev-parse HEAD > .artifacts/validated-commit.txt
+      - run: dotnet restore
+      - run: dotnet build -c Release --no-restore
+      - run: dotnet test -c Release --no-build --logger "trx;LogFileName=foundation.trx" --results-directory .artifacts/test-results
+      - name: Require passing PostgreSQL tests without skips
+        shell: pwsh
+        run: ./scripts/Assert-TestResults.ps1 -ResultsDirectory .artifacts/test-results
+      - run: dotnet tool restore
+      - run: dotnet ef migrations has-pending-model-changes --project src/FocusTime.Api --configuration Release --no-build
+      - run: dotnet ef migrations script --idempotent --project src/FocusTime.Api --configuration Release --no-build --output .artifacts/migrations.sql
+      - name: Build and smoke test Linux image
+        shell: bash
+        run: bash scripts/verify-linux-container.sh
+      - name: Save validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-foundation-validation
+          path: .artifacts/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

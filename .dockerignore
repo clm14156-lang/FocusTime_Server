@@ -1,0 +1,14 @@
+.git
+.tools
+.artifacts
+**/.artifacts
+**/appsettings.Local.json
+**/.env
+**/.env.*
+**/bin
+**/obj
+**/TestResults
+.env
+.env.*
+tests
+docs
