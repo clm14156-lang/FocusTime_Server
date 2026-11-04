@@ -8,13 +8,22 @@ public interface IEmailSender
     Task SendCodeAsync(string email, string purpose, string code, CancellationToken cancellationToken);
 }
 
-public sealed class EmailSender(IConfiguration configuration, IHostEnvironment environment) : IEmailSender
+public sealed class EmailSender(IConfiguration configuration, IHostEnvironment environment, ILogger<EmailSender> logger) : IEmailSender
 {
     public async Task SendCodeAsync(string email, string purpose, string code, CancellationToken cancellationToken)
     {
+        var mode = configuration["Email:Mode"];
+        if (string.Equals(mode, "Log", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!environment.IsDevelopment())
+                throw new AuthFault(503, "email_unavailable", "Development email delivery is unavailable.");
+            cancellationToken.ThrowIfCancellationRequested();
+            logger.LogInformation("Development email code for {Email} ({Purpose}): {Code}", email, purpose, code);
+            return;
+        }
         var subject = purpose == "register" ? "FocusTime 注册验证码" : "FocusTime 密码重置验证码";
         var body = $"您的验证码是：{code}。10 分钟内有效，请勿向他人提供。";
-        if (environment.IsDevelopment() && configuration["Email:Mode"] == "Pickup")
+        if (environment.IsDevelopment() && mode == "Pickup")
         {
             var folder = configuration["Email:PickupDirectory"] ??
                 Path.Combine(environment.ContentRootPath, ".artifacts", "mail");

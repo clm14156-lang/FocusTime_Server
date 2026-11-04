@@ -46,6 +46,24 @@ builder.Services.AddControllers()
         return new BadRequestObjectResult(problem) { ContentTypes = { "application/problem+json" } };
     });
 builder.Services.AddOpenApi();
+const string WebsiteAuthCors = "WebsiteAuth";
+var websiteOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? (builder.Environment.IsDevelopment()
+        ? ["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:5175", "http://localhost:5175"]
+        : []);
+foreach (var origin in websiteOrigins)
+{
+    if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri) ||
+        (uri.Scheme != Uri.UriSchemeHttps && !(builder.Environment.IsDevelopment() &&
+            uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback)) ||
+        uri.UserInfo.Length != 0 || uri.GetLeftPart(UriPartial.Authority) != origin)
+        throw new InvalidOperationException("Cors:AllowedOrigins must contain exact HTTPS origins or Development HTTP loopback origins.");
+}
+builder.Services.AddCors(options => options.AddPolicy(WebsiteAuthCors, policy => policy
+    .WithOrigins(websiteOrigins)
+    .WithMethods("POST")
+    .WithHeaders("Content-Type")
+    .WithExposedHeaders("Retry-After")));
 builder.Services.AddOptions<RequestRateLimitOptions>()
     .BindConfiguration("RateLimiting")
     .ValidateDataAnnotations()
@@ -122,6 +140,8 @@ app.UseExceptionHandler();
 app.UseStatusCodePages(context => ApiProblems.WriteAsync(context.HttpContext,
     context.HttpContext.Response.StatusCode));
 app.UseRouting();
+app.UseWhen(context => context.Request.Path.StartsWithSegments("/api/v1/auth"),
+    branch => branch.UseCors(WebsiteAuthCors));
 app.Use(async (context, next) =>
 {
     if (context.Request.Path.StartsWithSegments("/api/v1"))
