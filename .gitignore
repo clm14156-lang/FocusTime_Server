@@ -12,3 +12,9 @@ appsettings.Local.json
 *.user
 *.suo
 *.log
+
+# Keep local test code and test runners out of future commits.
+/tests/
+/scripts/Test-*.ps1
+/scripts/Assert-TestResults.ps1
+/scripts/verify-linux-container.sh

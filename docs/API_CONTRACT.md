@@ -20,6 +20,8 @@
 
 ## 已实现接口
 
+官网模拟支付、订单管理和会员开通异常的接口、状态及权限见 [模拟支付与真实订单管理](SIMULATED_PAYMENTS.md)。
+
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
 | GET | /api/v1/system/info | service、apiVersion |
@@ -68,14 +70,19 @@
 
 基础限流按直连来源 IP 分区，默认每 60 秒 120 次，不排队。健康检查和开发 OpenAPI 豁免。当前不信任任意 X-Forwarded-For；可信反向代理配置属于部署阶段。
 
-## 后续业务接口
+## 第六阶段会员接口
 
-以下路径省略 /api/v1 前缀，均尚未实现。
+付费套餐查询、管理员更新及订单价格/期限快照的当前契约见 [数据库会员套餐](MEMBERSHIP_PLANS.md)。公开目录为 `GET /api/v1/membership-plans`，管理端为 `GET/PUT /api/v1/admin/membership-plans[/{id}]`；订单继续使用既有路径，增加可选 `expectedPlanVersion`。模拟支付仅在开发测试环境开放。
+
+以下路径省略 /api/v1 前缀，已实现。除公钥外均需 Bearer 会话，响应禁止缓存。
 
 | 阶段 | 方法和路径 | 请求/响应契约 |
 | --- | --- | --- |
 | 6 | GET /me/membership | MembershipResponse |
-| 6 | POST /me/entitlement-lease | EntitlementLeaseResponse |
+| 6 | POST /me/entitlement-lease | 请求 apiScope / machineBinding / nonce（小写 SHA-256 格式）；响应 EntitlementLeaseResponse |
+| 6 | GET /entitlement-keys | 匿名，issuer 和 RSA SPKI 公钥列表；不自动建立客户端信任 |
+
+会员状态包含 kind（normal/annual/lifetime）、isActive、startsAtUtc、expiresAtUtc、version、entitlements、serverTimeUtc。租约响应包含 token、expiresAtUtc、keyId；最长 72 小时，受会员到期和会话绝对到期限制。用户、设备、会话及安装 ID 由认证会话决定，不能通过请求替换。签名、离线规则、公钥安装与受保护的人工管理命令见 [MEMBERSHIP.md](MEMBERSHIP.md)。真实支付平台尚未接入；开发测试模拟订单及开通接口见 [支付说明](SIMULATED_PAYMENTS.md)。
 
 ## 同步语义
 

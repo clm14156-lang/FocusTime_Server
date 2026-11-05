@@ -105,6 +105,8 @@ Set-Location E:\FocusTime_Server
 
 已在 A 实际验证：正常证书校验的 LAN HTTPS、Windows PowerShell 5.1 运行配置包的只读检查、LAN IP 数据库登录、错误口令拒绝、HBA 无解析错误、防火墙范围、2 个原账号保留、公钥包不含私钥、关闭/重新启用及重复启动复用现有进程。
 
-尚未远程操作 B。B 仍需执行上面的配置包和实际登录/上传操作，验证 Wi-Fi 路由、设备隔离及 B 自己的系统环境。第四阶段支持上传；另一台设备自动下载记录属于第五阶段。
+尚未远程操作 B。B 仍需执行配置包和实际登录/上传/下载操作，验证 Wi-Fi 路由、设备隔离及 B 自己的系统环境。第五阶段双向同步已经实现。
+
+2026-11-04 起，新版客户端的 Service 已内置当前服务器的会员验证公钥，B 配套更新 Desktop 与本地 Service 后，登录即可自动验证账号会员，无需额外下载或安装会员公钥。更新包为 `.artifacts/FocusTime-Client-AccountVip.zip`，配置包仍为 `.artifacts/FocusTime-LAN-client.zip`。旧配置包保留 `entitlement-trust.json` 和 `Install-MembershipTrust.ps1`，仅供旧客户端或管理员自定义信任使用。两类公钥信任的用途及覆盖规则见 [MEMBERSHIP.md](MEMBERSHIP.md)。局域网 HTTPS 自签名证书仍由前述连接配置处理。
 
 技术参考：[Kestrel 端点与证书配置](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel/endpoints?view=aspnetcore-10.0)、[Windows 自签名证书](https://learn.microsoft.com/en-us/powershell/module/pki/new-selfsignedcertificate?view=windowsserver2025-ps)、[PostgreSQL HBA 认证](https://www.postgresql.org/docs/18/auth-pg-hba-conf.html)。

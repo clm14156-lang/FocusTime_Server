@@ -8,6 +8,8 @@
 
 Development 默认 `Email:Mode=Pickup`，邮件写入 API 内容目录的 `.artifacts/mail/*.eml`；这是本地开发邮件，不会投递真实邮箱。测试运行器使用独立邮件目录。开发 HMAC 密钥首次使用时随机生成，保存在 API 内容目录的 `.artifacts/auth-secret.key`，需要保留，禁止提交。
 
+网站测试可使用后端的 `scripts/Get-LocalLoginCode.ps1`，按邮箱和用途读取，并核对数据库最新挑战与验证码摘要，避免误取其他实例或过期邮件。命令和本机配置见 [快速读取网站测试验证码](LOCAL_LOGIN_CODE.md)。
+
 正式环境通过安全配置或环境变量提供以下内容：
 
 | 配置 / 环境变量 | 内容 |

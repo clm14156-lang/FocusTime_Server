@@ -99,6 +99,20 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
 
     public async Task<TokenResponse> LoginAsync(LoginRequest request, CancellationToken ct)
     {
+        var (session, user, access, refresh) = await SignInAsync(request, null, ct);
+        return Response(session, user, access, refresh!);
+    }
+
+    public async Task<(UserProfile User, string AccessToken, DateTimeOffset ExpiresAtUtc)> LoginAdministratorAsync(
+        LoginRequest request, Func<Guid, bool> allows, CancellationToken ct)
+    {
+        var (session, user, access, _) = await SignInAsync(request, allows, ct);
+        return (Profile(user), access, session.AccessExpiresAtUtc);
+    }
+
+    private async Task<(LoginSession Session, AppUser User, string Access, string? Refresh)> SignInAsync(
+        LoginRequest request, Func<Guid, bool>? allowsAdministrator, CancellationToken ct)
+    {
         security.EnsureConfigured();
         if (request.Device.InstallationId == Guid.Empty)
             throw new AuthFault(400, "invalid_device", "InstallationId is required.");
@@ -120,6 +134,8 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
             await tx.CommitAsync(ct);
             throw new AuthFault(401, "invalid_credentials", "Email or password is incorrect.");
         }
+        if (allowsAdministrator is not null && !allowsAdministrator(user.Id))
+            throw new AuthFault(403, "administrator_required", "This account cannot access the administration site.");
         Check(await users.ResetAccessFailedCountAsync(user));
         var active = db.LoginSessions.Where(x => x.UserId == user.Id && x.RevokedAtUtc == null &&
             x.ExpiresAtUtc > Now && x.SecurityStamp == user.SecurityStamp);
@@ -139,22 +155,27 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         device.OperatingSystem = request.Device.OperatingSystem;
         device.ClientVersion = request.Device.ClientVersion;
         device.LastSeenAtUtc = Now;
+        var now = Now;
+        var expires = allowsAdministrator is null ? now.AddDays(30) : now.AddHours(8);
         var session = new LoginSession { UserId = user.Id, DeviceId = device.Id,
-            SecurityStamp = user.SecurityStamp!, CreatedAtUtc = Now, LastSeenAtUtc = Now, ExpiresAtUtc = Now.AddDays(30) };
+            SecurityStamp = user.SecurityStamp!, CreatedAtUtc = now, LastSeenAtUtc = now, ExpiresAtUtc = expires };
         db.LoginSessions.Add(session);
-        var response = Issue(session, user, AuthSecurity.RandomToken(), AuthSecurity.RandomToken());
+        var access = AuthSecurity.RandomToken();
+        var refresh = allowsAdministrator is null ? AuthSecurity.RandomToken() : null;
+        SetCredentials(session, access, refresh);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
-        return response;
+        return (session, user, access, refresh);
     }
 
-    private TokenResponse Issue(LoginSession session, AppUser user, string access, string refresh)
+    private void SetCredentials(LoginSession session, string access, string? refresh)
     {
         session.AccessHash = AuthSecurity.Hash(access);
         session.LastSeenAtUtc = Now;
-        session.AccessExpiresAtUtc = new[] { Now.AddMinutes(15), session.ExpiresAtUtc }.Min();
-        db.RefreshCredentials.Add(new RefreshCredential { SessionId = session.Id, TokenHash = AuthSecurity.Hash(refresh) });
-        return Response(session, user, access, refresh);
+        session.AccessExpiresAtUtc = refresh is null ? session.ExpiresAtUtc :
+            new[] { Now.AddMinutes(15), session.ExpiresAtUtc }.Min();
+        if (refresh is not null)
+            db.RefreshCredentials.Add(new RefreshCredential { SessionId = session.Id, TokenHash = AuthSecurity.Hash(refresh) });
     }
     private static TokenResponse Response(LoginSession session, AppUser user, string access, string refresh) =>
         new("Bearer", access, session.AccessExpiresAtUtc, refresh, session.ExpiresAtUtc,
@@ -190,12 +211,12 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         }
         credential.UsedAtUtc = Now;
         credential.RequestId = request.RequestId;
-        var response = Issue(session, user, access, refresh);
+        SetCredentials(session, access, refresh);
         credential.SuccessorId = db.ChangeTracker.Entries<RefreshCredential>()
             .Single(x => x.State == EntityState.Added).Entity.Id;
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
-        return response;
+        return Response(session, user, access, refresh);
     }
 
     public async Task LogoutAsync(string refreshToken, CancellationToken ct)

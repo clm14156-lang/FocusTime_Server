@@ -37,6 +37,10 @@
 
 客户端 SQLite v16 新增按账号/API 绑定隔离的 `focus_sync_progress` 与 `focus_sync_remote`，整页记录、删除标记和游标同事务写入，并迁移第四阶段延后删除队列。客户端原生专注、目标和任务表保留，下载不更新真实任务状态；详细规则见 [双向同步](FOCUS_SYNCHRONIZATION.md)。
 
+第六阶段迁移 `20261103135043_MembershipEntitlements` 新增 `membership.grants`（Id、UserId、Kind、StartsAtUtc、ExpiresAtUtc、CreatedAtUtc、RevokedAtUtc）、`membership.states`（UserId、Version）与 `membership.audit`（UserId、OperationId、GrantId、Action、RequestHash、Reason、Actor、Version、CreatedAtUtc）。全部以 UserId 外键关联 Identity，审计按用户/操作 ID 唯一，数据库约束年费必须有合法到期时间、永久会员不能有到期时间。授权与版本/审计在同一账号锁及事务中提交。
+
+客户端 SQLite v17 增加单行 `membership_cache`，保存由运行 Service 身份的 DPAPI CurrentUser 加密的签名证明、账号设备范围、时间检查点及会员版本；没有访问/刷新令牌和密码。现有记录、目标、任务及同步表不改变。升级保留原有迁移前备份机制，授权及离线策略见 [会员说明](MEMBERSHIP.md)。
+
 先创建专用的本地应用数据库及用户，再运行：
 
 ```powershell
@@ -46,6 +50,10 @@ dotnet run --project src/FocusTime.Api -- --migrate
 该命令应用待执行的迁移并退出。重复执行应保持已有数据。常规 Web 启动不自动迁移数据库；数据库连接成功但仍有待执行迁移时，就绪检查仍为 503。
 
 ## 新增迁移
+
+套餐目录新增 `20261105143836_MembershipPlans`：新建 `membership.plans`，扩展订单的价格关联、套餐名称/期限/版本快照。旧订单金额及会员授权不变，旧有限期订单保留日历月算法，新订单使用配置的天数。初始价格只在迁移中写入一次，随后以数据库为准，详情见 [会员套餐与价格](MEMBERSHIP_PLANS.md)。
+
+官网订单闭环新增 `20261105123719_OrderFulfillment`：扩展 `membership.orders` 的支付回执、会员开通状态、关联授权和失败原因，并增加 `membership.order_events` 处理日志。已有订单按实际授权记录回填；未找到授权的已支付订单进入异常。详情见 [模拟支付与真实订单管理](SIMULATED_PAYMENTS.md)。
 
 ```powershell
 dotnet tool restore

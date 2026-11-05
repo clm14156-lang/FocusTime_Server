@@ -1,6 +1,8 @@
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using FocusTime.Api.Common;
+using FocusTime.Api.Modules.Admin;
+using Microsoft.AspNetCore.Authorization;
 using FocusTime.Api.Infrastructure.Health;
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity;
@@ -15,10 +17,9 @@ using Microsoft.AspNetCore.Authentication;
 using FocusTime.Api.Modules.Membership;
 
 var builder = WebApplication.CreateBuilder(args);
-if (builder.Environment.IsDevelopment())
-    builder.Configuration.AddJsonFile(Path.Combine(builder.Environment.ContentRootPath,
-        ".artifacts", "test-memberships.json"), optional: true, reloadOnChange: true);
-builder.Services.AddSingleton<DevelopmentMemberships>();
+builder.Services.AddScoped<MembershipService>();
+builder.Services.AddScoped<MembershipOrderService>();
+builder.Services.AddSingleton<EntitlementSigner>();
 
 builder.Logging.ClearProviders();
 builder.Logging.AddJsonConsole(options =>
@@ -61,7 +62,7 @@ foreach (var origin in websiteOrigins)
 }
 builder.Services.AddCors(options => options.AddPolicy(WebsiteAuthCors, policy => policy
     .WithOrigins(websiteOrigins)
-    .WithMethods("POST")
+    .WithMethods("POST", "GET")
     .WithHeaders("Content-Type")
     .WithExposedHeaders("Retry-After")));
 builder.Services.AddOptions<RequestRateLimitOptions>()
@@ -122,10 +123,22 @@ builder.Services.AddScoped<DeviceSessionService>();
 builder.Services.AddScoped<FocusSyncService>();
 builder.Services.AddAuthentication(SessionAuthenticationHandler.SchemeName)
     .AddScheme<AuthenticationSchemeOptions, SessionAuthenticationHandler>(SessionAuthenticationHandler.SchemeName, _ => { });
+builder.Services.AddSingleton<AdminAccess>();
+builder.Services.AddSingleton<AdminMonitor>();
+builder.Services.AddHostedService<AdminMonitorPoller>();
 builder.Services.AddAuthorization();
+builder.Services.AddOptions<AuthorizationOptions>().Configure<AdminAccess>((options, admins) =>
+    options.AddPolicy(AdminAccess.Policy, policy => policy.RequireAuthenticatedUser()
+        .RequireAssertion(context => admins.Allows(context.User))));
 builder.Services.AddHealthChecks().AddCheck<DatabaseReadinessCheck>("database", tags: ["ready"]);
 
 var app = builder.Build();
+
+if (args.Contains("--membership-admin", StringComparer.Ordinal))
+{
+    await MembershipAdmin.RunAsync(args, app.Services);
+    return;
+}
 
 if (args.Contains("--migrate", StringComparer.Ordinal))
 {
@@ -135,12 +148,13 @@ if (args.Contains("--migrate", StringComparer.Ordinal))
     return;
 }
 
+_ = app.Services.GetRequiredService<EntitlementSigner>();
 app.UseMiddleware<RequestTraceMiddleware>();
 app.UseExceptionHandler();
 app.UseStatusCodePages(context => ApiProblems.WriteAsync(context.HttpContext,
     context.HttpContext.Response.StatusCode));
 app.UseRouting();
-app.UseWhen(context => context.Request.Path.StartsWithSegments("/api/v1/auth"),
+app.UseWhen(context => context.Request.Path.StartsWithSegments("/api/v1/auth") || context.Request.Path == "/api/v1/membership-plans",
     branch => branch.UseCors(WebsiteAuthCors));
 app.Use(async (context, next) =>
 {

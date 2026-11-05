@@ -109,6 +109,16 @@ Compress-Archive -LiteralPath @($certificateFile, (Join-Path $bundle 'server-inf
 & (Join-Path $clientRoot 'scripts/Start-LocalLoginServer.ps1') -ServerRoot $serverRoot -DatabasePort $DatabasePort
 $health = Invoke-RestMethod ($apiUrl + 'health/ready') -TimeoutSec 10
 if ($health.status -ne 'healthy') { throw 'LAN HTTPS API is not ready.' }
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $trust = Join-Path $bundle 'entitlement-trust.json'
+    & (Join-Path $PSScriptRoot 'Export-MembershipTrust.ps1') -ServerBaseUrl "http://localhost:5080/" -AllowedBaseUrls @("http://localhost:5080/", $apiUrl) -OutputPath $trust
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Install-MembershipTrust.ps1') -Destination $bundle -Force
+    & (Join-Path $PSScriptRoot 'Install-MembershipTrust.ps1') -TrustFile $trust
+    Add-Content -LiteralPath (Join-Path $bundle 'README.txt') -Value 'Membership: in administrator Windows PowerShell, run ./Install-MembershipTrust.ps1 -TrustFile ./entitlement-trust.json. Upgrade Desktop and Service together.'
+    Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath $zip -Force
+} else {
+    Write-Warning 'Membership trust setup requires PowerShell 7.2+. See docs/MEMBERSHIP.md after configuring LAN.'
+}
 Write-Output "LAN HTTPS ready: $apiUrl"
 Write-Output "LAN PostgreSQL: ${ip}:$DatabasePort; database/user: postgres; allowed subnet: $subnet"
 Write-Output "Computer B setup package: $zip"

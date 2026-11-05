@@ -13,7 +13,7 @@ namespace FocusTime.Api.Modules.Identity;
 [Route("api/v1/auth")]
 [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
 [EnableRateLimiting("auth")]
-public sealed class AuthController(AccountService accounts, AppDbContext db, DevelopmentMemberships memberships) : ControllerBase
+public sealed class AuthController(AccountService accounts, AppDbContext db, MembershipService memberships) : ControllerBase
 {
     [HttpPost("registration-code")]
     public Task<EmailChallengeResponse> RegistrationCode(EmailCodeRequest request, CancellationToken ct) =>
@@ -21,20 +21,20 @@ public sealed class AuthController(AccountService accounts, AppDbContext db, Dev
 
     [HttpPost("register")]
     public async Task<ActionResult<UserProfile>> Register(RegisterRequest request, CancellationToken ct) =>
-        StatusCode(201, memberships.Apply(await accounts.RegisterAsync(request, ct)));
+        StatusCode(201, await memberships.ApplyAsync(await accounts.RegisterAsync(request, ct), ct));
 
     [HttpPost("login")]
     public async Task<TokenResponse> Login(LoginRequest request, CancellationToken ct)
     {
         var response = await accounts.LoginAsync(request, ct);
-        return response with { User = memberships.Apply(response.User) };
+        return response with { User = await memberships.ApplyAsync(response.User, ct) };
     }
 
     [HttpPost("refresh")]
     public async Task<TokenResponse> Refresh(RefreshRequest request, CancellationToken ct)
     {
         var response = await accounts.RefreshAsync(request, ct);
-        return response with { User = memberships.Apply(response.User) };
+        return response with { User = await memberships.ApplyAsync(response.User, ct) };
     }
 
     // Possession of a refresh credential only grants revocation of its own session here.
@@ -52,7 +52,7 @@ public sealed class AuthController(AccountService accounts, AppDbContext db, Dev
     {
         var id = Guid.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
         var user = await db.Users.AsNoTracking().SingleAsync(x => x.Id == id, ct);
-        return memberships.Apply(new(user.Id, user.Email!, user.EmailConfirmed));
+        return await memberships.ApplyAsync(new(user.Id, user.Email!, user.EmailConfirmed), ct);
     }
 
     [HttpPost("password-reset/code")]

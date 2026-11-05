@@ -2,11 +2,15 @@
 
 FocusTime Windows 客户端的独立云端后端，采用 ASP.NET Core 10、EF Core 和 PostgreSQL 模块化单体。
 
-当前已实现基础能力、账号、设备管理及第五阶段专注记录双向增量同步：复用 Windows 客户端，支持持久化队列、归属确认、幂等重试、稳定分页下载、删除传播、账号历史隔离与本地保存恢复。会员及支付仍按后续阶段开发。
+当前已实现第一至第六阶段：账号、设备会话、专注记录双向增量同步，以及会员、人工发放撤销、签名离线权益和 Windows 本地服务权限检查。另已接入官网模拟支付和真实订单管理，支付确认、会员开通与异常重试均由后端持久化；尚未接入真实微信、支付宝扣款。客户端复用现有专注、屏蔽、记录与统计逻辑。
 
-本机后端 48 项测试通过，完整客户端 Release 构建及账号/设备/上传/双向同步 4 项真实联调通过。154 项客户端相关测试中 145 项通过，保留 9 项原有失败；另 38 项本地通信及恢复回归通过。完整证据见第五阶段记录；正式 SMTP、安装版与真实两机点选、Linux CI 尚待执行。当前测试后端已升级，运行中的旧客户端需配套更新后体验下载和删除传播。
+本轮后端 63 项测试全部通过，含 43 项真实 PostgreSQL 测试；客户端新增 25 项会员安全测试及双客户端真实会员联调通过。219 项相关回归中 210 项通过，保留同样 9 项原有失败。当前测试后端已备份升级，Desktop 和 Service 需配套更新。前五阶段提交的 Linux CI 已通过；本轮 Linux CI、正式 SMTP、安装版和物理两机界面仍待验收，证据见第六阶段记录。
 
 ## 文档
+
+- [数据库会员套餐、后台调价与官网同步](docs/MEMBERSHIP_PLANS.md)
+- [套餐管理实际验证结果](docs/MEMBERSHIP_PLANS_VALIDATION.md)
+- [官网模拟支付、真实订单与会员开通异常](docs/SIMULATED_PAYMENTS.md)
 
 - [后端分析](docs/BACKEND_ANALYSIS.md)
 - [七阶段开发计划与进度](docs/DEVELOPMENT_PLAN.md)
@@ -21,6 +25,8 @@ FocusTime Windows 客户端的独立云端后端，采用 ASP.NET Core 10、EF C
 - [第四阶段验证记录](docs/STAGE4_VALIDATION.md)
 - [双向增量同步与删除传播](docs/FOCUS_SYNCHRONIZATION.md)
 - [第五阶段验证记录](docs/STAGE5_VALIDATION.md)
+- [会员发放、权益、离线策略与客户端信任](docs/MEMBERSHIP.md)
+- [第六阶段验证记录](docs/STAGE6_VALIDATION.md)
 - [当前本机测试数据库与账号查询](docs/LOCAL_TEST_DATABASE.md)
 - [两台 Windows 电脑的局域网连接](docs/LAN_TESTING.md)
 

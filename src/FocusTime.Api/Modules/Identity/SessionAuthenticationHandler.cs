@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using System.Text.Encodings.Web;
 using FocusTime.Api.Common;
+using FocusTime.Api.Modules.Admin;
 using FocusTime.Api.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.EntityFrameworkCore;
@@ -19,8 +20,12 @@ public sealed class SessionAuthenticationHandler(IOptionsMonitor<AuthenticationS
         if (Context.GetEndpoint()?.Metadata.GetMetadata<IAllowAnonymous>() is not null)
             return AuthenticateResult.NoResult();
         var header = Request.Headers.Authorization.ToString();
-        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return AuthenticateResult.NoResult();
-        var token = header[7..].Trim();
+        string? token = null;
+        if (header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            token = header[7..].Trim();
+        else if (header.Length == 0 && Request.Path.StartsWithSegments(AdminAccess.Path))
+            token = Request.Cookies[AdminAccess.CookieName];
+        if (token is null) return AuthenticateResult.NoResult();
         if (token.Length != 64) return AuthenticateResult.Fail("Invalid bearer credential.");
         var hash = AuthSecurity.Hash(token);
         var now = clock.GetUtcNow();
