@@ -29,7 +29,8 @@ public static class AccountTransactions
         var accessHash = AuthSecurity.Hash(authorization[7..].Trim());
         return await (from s in db.LoginSessions.AsNoTracking() join u in db.Users.AsNoTracking() on s.UserId equals u.Id
             where s.Id == sessionId && s.UserId == userId && s.RevokedAtUtc == null && s.ExpiresAtUtc > now &&
-                s.AccessHash == accessHash && s.AccessExpiresAtUtc > now && s.SecurityStamp == u.SecurityStamp && u.EmailConfirmed select s)
+                s.AccessHash == accessHash && s.AccessExpiresAtUtc > now && s.SecurityStamp == u.SecurityStamp && u.EmailConfirmed && u.ClosedAtUtc == null &&
+                !(u.LockoutEnabled && u.LockoutEnd == DateTimeOffset.MaxValue) select s)
             .SingleOrDefaultAsync(ct) ?? throw new AuthFault(401, "session_expired", "Please sign in again.");
     }
 }

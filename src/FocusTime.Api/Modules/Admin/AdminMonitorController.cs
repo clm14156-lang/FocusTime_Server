@@ -24,7 +24,7 @@ public sealed record MonitorSnapshot(long CheckedAt, long HistoryStartedAt, Moni
 // These records describe health checks observed by this API process, not historical application logs.
 public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider clock)
 {
-    private static readonly string[] ServiceIds = ["api", "database", "account", "membership", "sync"];
+    private static readonly string[] ServiceIds = ["api", "database"];
     private readonly SemaphoreSlim gate = new(1);
     private readonly List<MonitorIncident> incidents = [];
     private readonly long historyStartedAt = clock.GetUtcNow().ToUnixTimeMilliseconds();
@@ -61,33 +61,42 @@ public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider c
 
     private static MonitorService ReadService(string id, HealthReport report)
     {
+        var metric = id == "api" ? "本次响应" : "检查耗时";
         if (!report.Entries.TryGetValue(id, out var entry))
-            return id == "api"
-                ? new(id, "healthy", null, null, "本次响应", "API 进程存活检查通过，外部访问仍需监控请求确认。")
-                : new(id, "unknown", null, null, id == "database" ? "检查耗时" : "响应", "尚未配置独立健康检查。");
+            return new(id, "unknown", null, null, metric, "尚未获取有效的健康检查结果。");
 
         var healthy = entry.Status == HealthStatus.Healthy;
         var note = healthy ? "健康检查通过。" : "健康检查未通过，恢复状态需后续检查确认。";
         if (id == "database" && !healthy)
             note = entry.Description == "Database migrations are pending."
                 ? "数据库存在待应用的迁移，就绪检查未通过。" : "数据库连接检查未通过。";
-        return new(id, healthy ? "healthy" : "unavailable", Math.Round(entry.Duration.TotalMilliseconds, 1),
-            null, "检查耗时", note);
+        // API request latency is measured by the caller. The database latency comes from its readiness check.
+        double? latency = id == "database" ? Math.Round(entry.Duration.TotalMilliseconds, 1) : null;
+        return new(id, healthy ? "healthy" : "unavailable", latency, null, metric, note);
     }
 }
 
-public sealed class AdminMonitorPoller(AdminMonitor monitor, ILogger<AdminMonitorPoller> logger) : BackgroundService
+public sealed class AdminMonitorPoller(AdminMonitor monitor, IServiceScopeFactory scopes,
+    ILogger<AdminMonitorPoller> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var interval = new PeriodicTimer(TimeSpan.FromSeconds(30));
         do
         {
-            try { await monitor.CheckAsync(stoppingToken); }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
-            catch (Exception)
+            try
             {
-                logger.LogWarning("Core service health checks could not be completed.");
+                var snapshot = await monitor.CheckAsync(stoppingToken);
+                if (snapshot.Checks.Any(x => x.Id == "database" && x.Status == "healthy"))
+                {
+                    await using var scope = scopes.CreateAsyncScope();
+                    await scope.ServiceProvider.GetRequiredService<AdminNotificationCollector>().ObserveAsync(snapshot, stoppingToken);
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+            catch (Exception error)
+            {
+                logger.LogWarning(error, "Core service checks or notification collection could not be completed.");
             }
         } while (await interval.WaitForNextTickAsync(stoppingToken));
     }

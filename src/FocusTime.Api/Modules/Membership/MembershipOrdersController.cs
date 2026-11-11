@@ -21,7 +21,8 @@ public sealed record MembershipOrderResponse(Guid Id, string OrderNumber, string
     string Method, string Status, DateTimeOffset CreatedAtUtc, DateTimeOffset ExpiresAtUtc, DateTimeOffset? PaidAtUtc,
     DateTimeOffset ServerTimeUtc, string ActivationStatus = "notStarted", Guid? MembershipGrantId = null,
     DateTimeOffset? ActivatedAtUtc = null, string? ActivationErrorCode = null, string? PlanName = null,
-    int? DurationDays = null, int? DurationMonths = null, long? PlanVersion = null);
+    int? DurationDays = null, int? DurationMonths = null, long? PlanVersion = null, DateTimeOffset? MembershipExpiresAtUtc = null,
+    DateTimeOffset? RefundedAtUtc = null);
 public sealed record MembershipPaymentResponse(MembershipOrderResponse Order, MembershipResponse Membership);
 
 [ApiController, Authorize, Route("api/v1/me/membership-orders"), EnableRateLimiting("auth"),
@@ -30,12 +31,24 @@ public sealed class MembershipOrdersController(AppDbContext db, MembershipOrderS
     IHostEnvironment environment) : ControllerBase
 {
     [HttpGet]
-    public async Task<IReadOnlyList<MembershipOrderResponse>> List(CancellationToken ct)
+    public async Task<IReadOnlyList<MembershipOrderResponse>> List(CancellationToken ct, [FromQuery] bool historyOnly = false)
     {
         var userId = Guid.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-        var orders = await db.MembershipOrders.AsNoTracking().Where(x => x.UserId == userId)
-            .OrderByDescending(x => x.CreatedAtUtc).ThenBy(x => x.Id).Take(50).ToListAsync(ct);
-        return orders.Select(ToResponse).ToArray();
+        var query = db.MembershipOrders.AsNoTracking().Where(x => x.UserId == userId);
+        if (historyOnly) query = query.Where(x => x.Status == "paid" || x.Status == "refunded");
+        var orders = await query.OrderByDescending(x => x.CreatedAtUtc).ThenBy(x => x.Id).Take(50).ToListAsync(ct);
+        var grantIds = orders.Where(x => x.MembershipGrantId != null).Select(x => x.MembershipGrantId!.Value).ToArray();
+        var expiries = await db.MembershipGrants.AsNoTracking().Where(x => x.UserId == userId && grantIds.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, x => x.ExpiresAtUtc, ct);
+        var refundedIds = orders.Where(x => x.Status == "refunded").Select(x => x.Id).ToArray();
+        var refunds = await db.MembershipOrderRefunds.AsNoTracking()
+            .Where(x => refundedIds.Contains(x.OrderId) && x.Status == "refunded")
+            .ToDictionaryAsync(x => x.OrderId, x => x.CompletedAtUtc, ct);
+        return orders.Select(order => ToResponse(order) with
+        {
+            MembershipExpiresAtUtc = order.MembershipGrantId is { } id ? expiries.GetValueOrDefault(id) : null,
+            RefundedAtUtc = refunds.TryGetValue(order.Id, out var refundedAt) ? refundedAt : null,
+        }).ToArray();
     }
 
     [HttpPost]
@@ -78,7 +91,6 @@ public sealed class MembershipOrdersController(AppDbContext db, MembershipOrderS
         var order = await FindOrderAsync(id, session.UserId, ct);
         RequirePending(order, clock.GetUtcNow());
         order.Method = request.Method;
-        orders.Record(order, "payment_method_changed", "website");
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
         return ToResponse(order);

@@ -19,10 +19,15 @@ public sealed class MembershipService(AppDbContext db, TimeProvider clock)
             x.RevokedAtUtc == null && x.StartsAtUtc <= now && (x.ExpiresAtUtc == null || x.ExpiresAtUtc > now))
             .OrderByDescending(x => x.Kind == "lifetime").ThenByDescending(x => x.ExpiresAtUtc)
             .ThenBy(x => x.Id).FirstOrDefaultAsync(ct);
+        // Display metadata only: retain the existing effective-grant selection and entitlement rules.
+        var isTrial = grant is { ExpiresAtUtc: not null } &&
+            await db.AdminMembershipAdjustments.AsNoTracking().AnyAsync(x => x.UserId == userId &&
+                x.GrantId == grant.Id && x.State == "applied" && x.Action == "grant" && x.ReasonCode == "trial" &&
+                !db.MembershipOrders.Any(order => order.MembershipGrantId == grant.Id), ct);
         return new(grant is null ? MembershipKind.Normal : grant.Kind == "lifetime" ? MembershipKind.Lifetime : MembershipKind.Annual,
             grant is not null, grant?.StartsAtUtc, grant?.ExpiresAtUtc, version,
             grant is null ? [] : [EntitlementCodes.ForcedMode, EntitlementCodes.AutomaticBlocking], now)
-        { Plan = grant?.Kind ?? "normal" };
+        { Plan = grant?.Kind ?? "normal", IsTrial = isTrial };
     }
 
     public async Task<UserProfile> ApplyAsync(UserProfile profile, CancellationToken ct) => profile with

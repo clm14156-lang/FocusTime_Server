@@ -15,7 +15,7 @@ public sealed record UpdateMembershipPlanRequest([param: Range(1, 100000000)] in
 
 [ApiController, Authorize(Policy = AdminAccess.Policy), Route("api/v1/admin/membership-plans"),
     ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
-public sealed class AdminMembershipPlansController(AppDbContext db, TimeProvider clock) : ControllerBase
+public sealed class AdminMembershipPlansController(AppDbContext db, TimeProvider clock, AdminAuditWriter audit) : ControllerBase
 {
     [HttpGet]
     public async Task<IReadOnlyList<MembershipPlanResponse>> List(CancellationToken ct) =>
@@ -38,6 +38,7 @@ public sealed class AdminMembershipPlansController(AppDbContext db, TimeProvider
         var plan = await db.MembershipPlans.SingleAsync(x => x.Id == id, ct);
         if (plan.Version != request.ExpectedVersion)
             throw new AuthFault(409, "plan_version_conflict", "The plan changed. Reload before saving.");
+        var before = MembershipPlanMapping.ToResponse(plan);
         plan.AmountFen = request.AmountFen;
         plan.DurationDays = request.DurationDays;
         plan.Available = request.Available;
@@ -45,6 +46,7 @@ public sealed class AdminMembershipPlansController(AppDbContext db, TimeProvider
         plan.Version++;
         plan.UpdatedAtUtc = DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds());
         plan.UpdatedByUserId = session.UserId;
+        await audit.StagePlanChange(HttpContext, before, plan, ct);
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
         return MembershipPlanMapping.ToResponse(plan);

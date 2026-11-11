@@ -32,7 +32,8 @@ public sealed class SessionAuthenticationHandler(IOptionsMonitor<AuthenticationS
         var session = await (from item in db.LoginSessions.AsNoTracking()
             join user in db.Users.AsNoTracking() on item.UserId equals user.Id
             where item.AccessHash == hash && item.RevokedAtUtc == null && item.AccessExpiresAtUtc > now &&
-                item.ExpiresAtUtc > now && item.SecurityStamp == user.SecurityStamp
+                item.ExpiresAtUtc > now && item.SecurityStamp == user.SecurityStamp && user.ClosedAtUtc == null &&
+                !(user.LockoutEnabled && user.LockoutEnd == DateTimeOffset.MaxValue)
             select item).SingleOrDefaultAsync(Context.RequestAborted);
         if (session is null) return AuthenticateResult.Fail("Invalid or expired session.");
         // Throttle activity writes; a concurrent revocation can never be overwritten here.

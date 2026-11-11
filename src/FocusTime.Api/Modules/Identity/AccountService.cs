@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using FocusTime.Api.Modules.Sessions;
+using FocusTime.Api.Modules.Sessions.Contracts;
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity.Contracts;
 using Microsoft.AspNetCore.Identity;
@@ -31,6 +32,9 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         await LockAsync(email, ct);
         var recent = await db.EmailChallenges.Where(x => x.Email == email &&
             x.CreatedAtUtc > Now.AddHours(-1)).ToListAsync(ct);
+        var securityCodes = await db.SecurityChallenges.Where(x => x.Email == email && x.CreatedAtUtc > Now.AddHours(-1))
+            .Select(x => x.CreatedAtUtc).ToListAsync(ct);
+        recent.AddRange(securityCodes.Select(created => new EmailChallenge { CreatedAtUtc = created }));
         var last = recent.OrderByDescending(x => x.CreatedAtUtc).FirstOrDefault();
         if (last is not null && last.CreatedAtUtc > Now.AddSeconds(-60) || recent.Count >= 5)
         {
@@ -47,7 +51,7 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         foreach (var previous in recent.Where(x => x.Purpose == purpose)) previous.Consumed = true;
         db.EmailChallenges.Add(challenge);
         // Unknown reset accounts receive the same challenge shape, but no email and no usable ticket.
-        if (purpose == "register" || await users.FindByEmailAsync(email) is not null)
+        if (purpose == "register" || await users.FindByEmailAsync(email) is { ClosedAtUtc: null })
         {
             try { await mail.SendCodeAsync(email, purpose, code, ct); }
             catch (AuthFault fault) when (purpose == "reset" && fault.Code == "email_unavailable")
@@ -82,9 +86,8 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         return challenge;
     }
 
-    public async Task<UserProfile> RegisterAsync(RegisterRequest request, CancellationToken ct)
+    private async Task<AppUser> RegisterUserAsync(RegisterRequest request, CancellationToken ct)
     {
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         var challenge = await VerifyCodeAsync(request.ChallengeId, "register", request.Code, request.Email, ct);
         if (await users.FindByEmailAsync(challenge.Email) is not null)
             throw new AuthFault(409, "email_registered", "This email is already registered.");
@@ -92,9 +95,30 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
             EmailConfirmed = true, LockoutEnabled = true };
         Check(await users.CreateAsync(user, request.Password));
         challenge.Consumed = true;
+        return user;
+    }
+
+    public async Task<UserProfile> RegisterAsync(RegisterRequest request, CancellationToken ct)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var user = await RegisterUserAsync(request, ct);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
         return Profile(user);
+    }
+
+    public async Task<TokenResponse> RegisterWithSessionAsync(RegisterRequest request, CancellationToken ct)
+    {
+        security.EnsureConfigured();
+        var device = request.Device;
+        if (device is null || device.InstallationId == Guid.Empty)
+            throw new AuthFault(400, "invalid_device", "InstallationId is required.");
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var user = await RegisterUserAsync(request, ct);
+        var (session, access, refresh) = await CreateSessionAsync(user, device, false, ct);
+        // Account, consumed challenge and login credentials commit together.
+        await tx.CommitAsync(ct);
+        return Response(session, user, access, refresh!);
     }
 
     public async Task<TokenResponse> LoginAsync(LoginRequest request, CancellationToken ct)
@@ -119,12 +143,14 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(request.Email, ct);
         var user = await users.FindByEmailAsync(Normalize(request.Email));
-        if (user is null)
+        if (user is null || user.ClosedAtUtc is not null)
         {
             // Match the expensive password hash path for unknown accounts.
             _ = users.PasswordHasher.HashPassword(new AppUser(), request.Password);
             throw new AuthFault(401, "invalid_credentials", "Email or password is incorrect.");
         }
+        if (user.LockoutEnabled && user.LockoutEnd == DateTimeOffset.MaxValue)
+            throw new AuthFault(403, "account_disabled", "This account has been disabled.");
         if (await users.IsLockedOutAsync(user))
             throw new AuthFault(429, "account_locked", "Too many failed attempts. Try again later.",
                 Math.Max(1, (int)Math.Ceiling(((user.LockoutEnd ?? Now.AddMinutes(15)) - Now).TotalSeconds)));
@@ -137,35 +163,42 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         if (allowsAdministrator is not null && !allowsAdministrator(user.Id))
             throw new AuthFault(403, "administrator_required", "This account cannot access the administration site.");
         Check(await users.ResetAccessFailedCountAsync(user));
+        var (session, access, refresh) = await CreateSessionAsync(user, request.Device, allowsAdministrator is not null, ct);
+        await tx.CommitAsync(ct);
+        return (session, user, access, refresh);
+    }
+
+    private async Task<(LoginSession Session, string Access, string? Refresh)> CreateSessionAsync(
+        AppUser user, DeviceRegistration registration, bool administrator, CancellationToken ct)
+    {
         var active = db.LoginSessions.Where(x => x.UserId == user.Id && x.RevokedAtUtc == null &&
             x.ExpiresAtUtc > Now && x.SecurityStamp == user.SecurityStamp);
         if (await active.CountAsync(ct) >= 100)
             throw new AuthFault(409, "session_limit_reached", "Sign out an existing session before signing in again.");
         var device = await db.LoginDevices.SingleOrDefaultAsync(x => x.UserId == user.Id &&
-            x.InstallationId == request.Device.InstallationId, ct);
+            x.InstallationId == registration.InstallationId, ct);
         if (device is null)
         {
-            device = new LoginDevice { UserId = user.Id, InstallationId = request.Device.InstallationId,
+            device = new LoginDevice { UserId = user.Id, InstallationId = registration.InstallationId,
                 CreatedAtUtc = Now };
             db.LoginDevices.Add(device);
         }
         else if (await active.CountAsync(x => x.DeviceId == device.Id, ct) >= 10)
             throw new AuthFault(409, "session_limit_reached", "Sign out an existing session on this device first.");
-        device.Name = request.Device.Name;
-        device.OperatingSystem = request.Device.OperatingSystem;
-        device.ClientVersion = request.Device.ClientVersion;
+        device.Name = registration.Name;
+        device.OperatingSystem = registration.OperatingSystem;
+        device.ClientVersion = registration.ClientVersion;
         device.LastSeenAtUtc = Now;
         var now = Now;
-        var expires = allowsAdministrator is null ? now.AddDays(30) : now.AddHours(8);
+        var expires = !administrator ? now.AddDays(30) : now.AddHours(8);
         var session = new LoginSession { UserId = user.Id, DeviceId = device.Id,
             SecurityStamp = user.SecurityStamp!, CreatedAtUtc = now, LastSeenAtUtc = now, ExpiresAtUtc = expires };
         db.LoginSessions.Add(session);
         var access = AuthSecurity.RandomToken();
-        var refresh = allowsAdministrator is null ? AuthSecurity.RandomToken() : null;
+        var refresh = !administrator ? AuthSecurity.RandomToken() : null;
         SetCredentials(session, access, refresh);
         await db.SaveChangesAsync(ct);
-        await tx.CommitAsync(ct);
-        return (session, user, access, refresh);
+        return (session, access, refresh);
     }
 
     private void SetCredentials(LoginSession session, string access, string? refresh)
@@ -181,6 +214,15 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         new("Bearer", access, session.AccessExpiresAtUtc, refresh, session.ExpiresAtUtc,
             session.Id, session.DeviceId, Profile(user));
 
+    internal async Task<TokenResponse> ReplaceSessionCredentialsAsync(AppUser user, LoginSession session, CancellationToken ct)
+    {
+        await db.RefreshCredentials.Where(x => x.SessionId == session.Id).ExecuteDeleteAsync(ct);
+        session.SecurityStamp = user.SecurityStamp!;
+        var access = AuthSecurity.RandomToken(); var refresh = AuthSecurity.RandomToken();
+        SetCredentials(session, access, refresh);
+        return Response(session, user, access, refresh);
+    }
+
     public async Task<TokenResponse> RefreshAsync(RefreshRequest request, CancellationToken ct)
     {
         if (request.RequestId == Guid.Empty) throw new AuthFault(400, "invalid_request_id", "RequestId is required.");
@@ -194,7 +236,8 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         var credential = await db.RefreshCredentials.SingleAsync(x => x.TokenHash == hash, ct);
         var session = await db.LoginSessions.SingleAsync(x => x.Id == credential.SessionId, ct);
         var user = await db.Users.SingleAsync(x => x.Id == session.UserId, ct);
-        if (session.RevokedAtUtc is not null || session.ExpiresAtUtc <= Now || session.SecurityStamp != user.SecurityStamp)
+        if (user.ClosedAtUtc is not null || (user.LockoutEnabled && user.LockoutEnd == DateTimeOffset.MaxValue) ||
+            session.RevokedAtUtc is not null || session.ExpiresAtUtc <= Now || session.SecurityStamp != user.SecurityStamp)
             throw InvalidSession();
         var access = security.Derive($"access:{request.RefreshToken}:{request.RequestId:N}");
         var refresh = security.Derive($"refresh:{request.RefreshToken}:{request.RequestId:N}");
@@ -239,7 +282,7 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         var challenge = await VerifyCodeAsync(request.ChallengeId, "reset", request.Code, null, ct);
-        if (await users.FindByEmailAsync(challenge.Email) is null) throw InvalidCode();
+        if (await users.FindByEmailAsync(challenge.Email) is not { ClosedAtUtc: null }) throw InvalidCode();
         var ticket = AuthSecurity.RandomToken();
         challenge.Consumed = true;
         challenge.TicketHash = AuthSecurity.Hash(ticket);
@@ -260,11 +303,13 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         if (challenge.TicketConsumed || challenge.TicketExpiresAtUtc <= Now)
             throw new AuthFault(400, "invalid_reset_ticket", "The reset ticket is invalid or expired.");
         var user = await users.FindByEmailAsync(challenge.Email) ?? throw InvalidCode();
+        if (user.ClosedAtUtc is not null) throw InvalidCode();
         foreach (var validator in users.PasswordValidators) Check(await validator.ValidateAsync(users, user, request.NewPassword));
         user.PasswordHash = users.PasswordHasher.HashPassword(user, request.NewPassword);
         Check(await users.UpdateSecurityStampAsync(user));
         user.AccessFailedCount = 0;
-        user.LockoutEnd = null;
+        // Password recovery may clear a temporary lockout. Permanent administrative bans require restoration.
+        if (user.LockoutEnd != DateTimeOffset.MaxValue) user.LockoutEnd = null;
         challenge.TicketConsumed = true;
         // Invalidate every outstanding recovery capability, including previously issued tickets.
         await db.EmailChallenges.Where(x => x.Email == challenge.Email && x.Purpose == "reset")

@@ -9,7 +9,7 @@ public sealed record RegisterRequest(
     [param: Required, EmailAddress, MaxLength(256)] string Email,
     Guid ChallengeId,
     [param: Required, RegularExpression("^[0-9]{6}$")] string Code,
-    [param: Required, MinLength(8), MaxLength(128)] string Password);
+    [param: Required, MinLength(8), MaxLength(128)] string Password, DeviceRegistration? Device = null);
 public sealed record LoginRequest(
     [param: Required, EmailAddress, MaxLength(256)] string Email,
     [param: Required, MaxLength(128)] string Password,

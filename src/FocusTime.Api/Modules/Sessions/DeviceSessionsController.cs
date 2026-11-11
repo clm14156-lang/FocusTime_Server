@@ -32,6 +32,13 @@ public sealed class DeviceSessionsController(DeviceSessionService sessions) : Co
         return NoContent();
     }
 
+    [HttpPost("api/v1/me/devices/logout-others")]
+    public async Task<IActionResult> LogoutOthers(CancellationToken ct)
+    {
+        await sessions.RevokeOthersAsync(UserId, SessionId, ct);
+        return NoContent();
+    }
+
     [HttpPost("api/v1/auth/logout-all")]
     public async Task<IActionResult> LogoutAll(CancellationToken ct)
     {

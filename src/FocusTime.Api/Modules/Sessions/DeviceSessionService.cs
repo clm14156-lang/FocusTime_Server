@@ -1,3 +1,4 @@
+using FocusTime.Api.Modules.AccountSecurity;
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity;
 using FocusTime.Api.Modules.Sessions.Contracts;
@@ -14,7 +15,7 @@ public sealed class DeviceSessionService(AppDbContext db, TimeProvider clock)
             ?? throw new AuthFault(401, "invalid_session", "Please sign in again.");
         await AccountTransactions.LockAsync(db, user.Email!, ct);
         await db.Entry(user).ReloadAsync(ct);
-        if (!await db.LoginSessions.AnyAsync(x => x.Id == sessionId && x.UserId == userId &&
+        if (user.ClosedAtUtc is not null || !await db.LoginSessions.AnyAsync(x => x.Id == sessionId && x.UserId == userId &&
             x.RevokedAtUtc == null && x.AccessExpiresAtUtc > Now && x.ExpiresAtUtc > Now &&
             x.SecurityStamp == user.SecurityStamp, ct))
             throw new AuthFault(401, "invalid_session", "Please sign in again.");
@@ -45,17 +46,41 @@ public sealed class DeviceSessionService(AppDbContext db, TimeProvider clock)
         return response;
     }
 
-    public async Task RevokeAsync(Guid userId, Guid callerSessionId, Guid? deviceId, Guid? targetSessionId, CancellationToken ct)
+    public Task RevokeAsync(Guid userId, Guid callerSessionId, Guid? deviceId, Guid? targetSessionId, CancellationToken ct) =>
+        LoggedRevokeAsync(userId, callerSessionId, deviceId, targetSessionId, false, ct);
+
+    public Task RevokeOthersAsync(Guid userId, Guid callerSessionId, CancellationToken ct) =>
+        LoggedRevokeAsync(userId, callerSessionId, null, null, true, ct);
+
+    private async Task LoggedRevokeAsync(Guid userId, Guid callerSessionId, Guid? deviceId, Guid? targetSessionId, bool others, CancellationToken ct)
+    {
+        var operation = others ? "devices.logout-others" : deviceId is not null ? "devices.logout" : "sessions.logout";
+        try { await RevokeCoreAsync(userId, callerSessionId, deviceId, targetSessionId, others, operation, ct); }
+        catch (AuthFault fault)
+        {
+            db.ChangeTracker.Clear();
+            db.AccountSecurityAudits.Add(new() { UserId = userId, SessionId = callerSessionId, Operation = operation,
+                Result = "failed", FailureCode = fault.Code, OccurredAtUtc = Now });
+            await db.SaveChangesAsync(ct); throw;
+        }
+    }
+
+    private async Task RevokeCoreAsync(Guid userId, Guid callerSessionId, Guid? deviceId, Guid? targetSessionId, bool others, string operation, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockCallerAsync(userId, callerSessionId, ct);
         if (deviceId is { } device && !await db.LoginDevices.AnyAsync(x => x.Id == device && x.UserId == userId, ct) ||
             targetSessionId is { } target && !await db.LoginSessions.AnyAsync(x => x.Id == target && x.UserId == userId, ct))
             throw new AuthFault(404, "not_found", "Device or session was not found.");
+        var currentDevice = await db.LoginSessions.Where(x => x.Id == callerSessionId).Select(x => x.DeviceId).SingleAsync(ct);
         var query = db.LoginSessions.Where(x => x.UserId == userId && x.RevokedAtUtc == null);
+        if (others) query = query.Where(x => x.DeviceId != currentDevice);
         if (deviceId is not null) query = query.Where(x => x.DeviceId == deviceId);
         if (targetSessionId is not null) query = query.Where(x => x.Id == targetSessionId);
         await query.ExecuteUpdateAsync(set => set.SetProperty(x => x.RevokedAtUtc, Now), ct);
+        db.AccountSecurityAudits.Add(new() { UserId = userId, SessionId = callerSessionId, Operation = operation,
+            Result = "success", OccurredAtUtc = Now });
+        await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
     }
 }

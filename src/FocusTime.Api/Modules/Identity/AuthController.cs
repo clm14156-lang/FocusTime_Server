@@ -20,8 +20,14 @@ public sealed class AuthController(AccountService accounts, AppDbContext db, Mem
         accounts.SendCodeAsync(request.Email, "register", ct);
 
     [HttpPost("register")]
-    public async Task<ActionResult<UserProfile>> Register(RegisterRequest request, CancellationToken ct) =>
-        StatusCode(201, await memberships.ApplyAsync(await accounts.RegisterAsync(request, ct), ct));
+    public async Task<IActionResult> Register(RegisterRequest request, CancellationToken ct)
+    {
+        // Existing clients without a device retain their registration response.
+        if (request.Device is null)
+            return StatusCode(201, await memberships.ApplyAsync(await accounts.RegisterAsync(request, ct), ct));
+        var response = await accounts.RegisterWithSessionAsync(request, ct);
+        return StatusCode(201, response with { User = await memberships.ApplyAsync(response.User, ct) });
+    }
 
     [HttpPost("login")]
     public async Task<TokenResponse> Login(LoginRequest request, CancellationToken ct)

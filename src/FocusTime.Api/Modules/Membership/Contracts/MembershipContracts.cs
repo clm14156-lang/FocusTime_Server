@@ -5,6 +5,7 @@ public sealed record MembershipResponse(MembershipKind Kind, bool IsActive, Date
     DateTimeOffset? ExpiresAtUtc, long Version, IReadOnlyList<string> Entitlements, DateTimeOffset ServerTimeUtc)
 {
     public string Plan { get; init; } = "normal";
+    public bool IsTrial { get; init; }
 }
 public sealed record EntitlementLeaseResponse(string Token, DateTimeOffset ExpiresAtUtc, string KeyId);
 

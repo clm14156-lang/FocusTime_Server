@@ -13,7 +13,7 @@ namespace FocusTime.Api.Modules.Admin;
 public sealed class AdminOrderQuery
 {
     [MaxLength(256)] public string? Query { get; set; }
-    [RegularExpression("^(all|pending|paid|closed)$")] public string Status { get; set; } = "all";
+    [RegularExpression("^(all|pending|paid|closed|refunding|refunded|paid-or-refunded)$")] public string Status { get; set; } = "all";
     [RegularExpression("^(all|monthly|annual|lifetime)$")] public string Plan { get; set; } = "all";
     [RegularExpression("^(all|wechat|alipay)$")] public string Method { get; set; } = "all";
     [RegularExpression("^(all|week|month|quarter)$")] public string Range { get; set; } = "all";
@@ -26,7 +26,9 @@ public sealed class AdminOrderQuery
 public sealed record AdminOrderEvent(Guid Id, string Kind, string Actor, DateTimeOffset OccurredAtUtc);
 public sealed record AdminOrder(MembershipOrderResponse Order, Guid UserId, string Email,
     DateTimeOffset? MembershipStartsAtUtc, DateTimeOffset? MembershipExpiresAtUtc,
-    DateTimeOffset? ActivationAttemptedAtUtc, IReadOnlyList<AdminOrderEvent> Events);
+    DateTimeOffset? ActivationAttemptedAtUtc, IReadOnlyList<AdminOrderEvent> Events,
+    string? PaymentProvider = null, string? PaymentReference = null, DateTimeOffset? MembershipRevokedAtUtc = null,
+    AdminOrderRefundInfo? Refund = null);
 public sealed record AdminOrderStat(string Key, int Count, double Share, int[] Trend);
 internal sealed record AdminOrderDay(DateOnly Day, string Status, string ActivationStatus, int Count);
 public sealed record AdminOrdersPage(IReadOnlyList<AdminOrder> Items, int Total, int Page, int PageSize,
@@ -34,7 +36,7 @@ public sealed record AdminOrdersPage(IReadOnlyList<AdminOrder> Items, int Total,
 
 [ApiController, Authorize(Policy = AdminAccess.Policy), Route("api/v1/admin/orders"),
     ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
-public sealed class AdminOrdersController(AppDbContext db, MembershipOrderService orders, TimeProvider clock) : ControllerBase
+public sealed class AdminOrdersController(AppDbContext db, MembershipOrderService orders, TimeProvider clock, AdminOrderRefundService refunds) : ControllerBase
 {
     private sealed class Row
     {
@@ -66,8 +68,8 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
         var today = DateOnly.FromDateTime(now.ToOffset(TimeSpan.FromHours(8)).DateTime);
         var first = groups.Count == 0 ? today : groups.Min(x => x.Day);
         var span = Math.Max(1, today.DayNumber - first.DayNumber + 1);
-        var counts = new int[3];
-        var trends = new[] { new int[7], new int[7], new int[7] };
+        var counts = new int[4];
+        var trends = new[] { new int[7], new int[7], new int[7], new int[7] };
         foreach (var group in groups)
         {
             var bucket = Math.Clamp((group.Day.DayNumber - first.DayNumber) * 7 / span, 0, 6);
@@ -75,11 +77,12 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
             if (group.Status == "paid")
             {
                 counts[1] += group.Count; trends[1][bucket] += group.Count;
-                if (group.ActivationStatus != "activated") { counts[2] += group.Count; trends[2][bucket] += group.Count; }
+                if (group.ActivationStatus is not ("activated" or "revoked")) { counts[3] += group.Count; trends[3][bucket] += group.Count; }
             }
+            if (group.Status == "refunded") { counts[2] += group.Count; trends[2][bucket] += group.Count; }
         }
-        var keys = new[] { "total", "paid", "exceptions" };
-        var stats = Enumerable.Range(0, 3).Select(index => new AdminOrderStat(keys[index], counts[index],
+        var keys = new[] { "total", "paid", "refunded", "exceptions" };
+        var stats = Enumerable.Range(0, 4).Select(index => new AdminOrderStat(keys[index], counts[index],
             counts[0] == 0 ? 0 : (double)counts[index] / counts[0], trends[index])).ToArray();
         await snapshot.CommitAsync(ct);
         return new(items, total, page, query.PageSize, stats, now);
@@ -107,6 +110,14 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
         return await DetailAsync(id, ct);
     }
 
+    [HttpPost("{id:guid}/refund")]
+    public async Task<ActionResult<AdminOrder>> Refund(Guid id, AdminOrderRefundRequest request, CancellationToken ct)
+    {
+        if (Request.Headers["X-FocusTime-Admin"] != "1") return StatusCode(403);
+        await refunds.Refund(id, request, HttpContext, ct);
+        return await DetailAsync(id, ct);
+    }
+
     private IQueryable<MembershipOrder> InRange(AdminOrderQuery query, DateTimeOffset now)
     {
         var result = db.MembershipOrders.AsNoTracking();
@@ -123,14 +134,19 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
             TimeSpan.FromHours(8)).ToUniversalTime();
     }
 
+    internal static IQueryable<MembershipOrder> PendingOrderExceptions(IQueryable<MembershipOrder> source) =>
+        source.Where(x => x.Status == "paid" && x.ActivationStatus != "activated" && x.ActivationStatus != "revoked");
+
     private IQueryable<Row> Filter(IQueryable<MembershipOrder> source, AdminOrderQuery query, DateTimeOffset now)
     {
         if (query.Status == "pending") source = source.Where(x => x.Status == "pending" && x.ExpiresAtUtc > now);
-        if (query.Status == "closed") source = source.Where(x => x.Status == "pending" && x.ExpiresAtUtc <= now);
+        if (query.Status == "closed") source = source.Where(x => x.Status == "pending" && x.ExpiresAtUtc <= now || x.Status == "closed" || x.Status == "expired");
         if (query.Status == "paid") source = source.Where(x => x.Status == "paid");
+        if (query.Status == "paid-or-refunded") source = source.Where(x => x.Status == "paid" || x.Status == "refunded");
+        if (query.Status is "refunding" or "refunded") source = source.Where(x => x.Status == query.Status);
         if (query.Plan != "all") source = source.Where(x => x.Plan == query.Plan);
         if (query.Method != "all") source = source.Where(x => x.Method == query.Method);
-        if (query.ExceptionOnly) source = source.Where(x => x.Status == "paid" && x.ActivationStatus != "activated");
+        if (query.ExceptionOnly) source = PendingOrderExceptions(source);
         var result = from order in source join user in db.Users.AsNoTracking() on order.UserId equals user.Id
             select new Row { Order = order, Email = user.Email! };
         if (!string.IsNullOrWhiteSpace(query.Query))
@@ -160,6 +176,7 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
         var grantIds = rows.Where(x => x.Order.MembershipGrantId.HasValue).Select(x => x.Order.MembershipGrantId!.Value).ToArray();
         var grants = await db.MembershipGrants.AsNoTracking().Where(x => grantIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, ct);
         var ids = rows.Select(x => x.Order.Id).ToArray();
+        var receipts = await db.MembershipOrderRefunds.AsNoTracking().Where(x => ids.Contains(x.OrderId)).ToDictionaryAsync(x => x.OrderId, ct);
         var events = includeEvents ? await db.MembershipOrderEvents.AsNoTracking().Where(x => ids.Contains(x.OrderId))
             .OrderBy(x => x.OccurredAtUtc).ThenBy(x => x.Id).ToListAsync(ct) : [];
         return rows.Select(row =>
@@ -167,7 +184,9 @@ public sealed class AdminOrdersController(AppDbContext db, MembershipOrderServic
             var grant = grants.GetValueOrDefault(row.Order.MembershipGrantId ?? Guid.Empty);
             return new AdminOrder(MembershipOrderService.ToResponse(row.Order, now), row.Order.UserId, row.Email,
                 grant?.StartsAtUtc, grant?.ExpiresAtUtc, row.Order.ActivationAttemptedAtUtc,
-                events.Where(x => x.OrderId == row.Order.Id).Select(x => new AdminOrderEvent(x.Id, x.Kind, x.Actor, x.OccurredAtUtc)).ToArray());
+                events.Where(x => x.OrderId == row.Order.Id).Select(x => new AdminOrderEvent(x.Id, x.Kind, x.Actor, x.OccurredAtUtc)).ToArray(),
+                row.Order.PaymentProvider, row.Order.PaymentReference, grant?.RevokedAtUtc,
+                refunds.Describe(row.Order, receipts.GetValueOrDefault(row.Order.Id), grant, now));
         }).ToArray();
     }
 }

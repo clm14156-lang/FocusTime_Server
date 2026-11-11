@@ -6,5 +6,7 @@ public sealed class AppUser : IdentityUser<Guid>
 {
     public AppUser() => Id = Guid.NewGuid();
 
+    public DateTimeOffset? ClosedAtUtc { get; set; }
+
     public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
 }

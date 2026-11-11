@@ -1,3 +1,4 @@
+using FocusTime.Api.Modules.AccountSecurity;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using FocusTime.Api.Common;
@@ -19,6 +20,10 @@ using FocusTime.Api.Modules.Membership;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddScoped<MembershipService>();
 builder.Services.AddScoped<MembershipOrderService>();
+builder.Services.AddScoped<AdminOrderRefundService>();
+builder.Services.AddScoped<AdminMembershipAdjustmentService>();
+builder.Services.AddScoped<AdminAuditWriter>();
+builder.Services.AddScoped<AdminOperationFailureFilter>();
 builder.Services.AddSingleton<EntitlementSigner>();
 
 builder.Logging.ClearProviders();
@@ -33,7 +38,7 @@ builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
     ApiProblems.Enrich(context.HttpContext, context.ProblemDetails));
 builder.Services.AddExceptionHandler<ApiExceptionHandler>();
-builder.Services.AddControllers()
+builder.Services.AddControllers(options => options.Filters.AddService<AdminOperationFailureFilter>(-3000))
     .AddJsonOptions(options => options.JsonSerializerOptions.Converters.Add(
         new JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.CamelCase, allowIntegerValues: false)))
     .ConfigureApiBehaviorOptions(options => options.InvalidModelStateResponseFactory = context =>
@@ -119,18 +124,24 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<AuthSecurity>();
 builder.Services.AddScoped<IEmailSender, EmailSender>();
 builder.Services.AddScoped<AccountService>();
+builder.Services.AddScoped<AccountSecurityService>();
+builder.Services.AddScoped<SecurityNotificationDispatcher>();
+builder.Services.AddHostedService<SecurityNotificationWorker>();
 builder.Services.AddScoped<DeviceSessionService>();
 builder.Services.AddScoped<FocusSyncService>();
 builder.Services.AddAuthentication(SessionAuthenticationHandler.SchemeName)
     .AddScheme<AuthenticationSchemeOptions, SessionAuthenticationHandler>(SessionAuthenticationHandler.SchemeName, _ => { });
 builder.Services.AddSingleton<AdminAccess>();
 builder.Services.AddSingleton<AdminMonitor>();
+builder.Services.AddScoped<AdminNotificationCollector>();
 builder.Services.AddHostedService<AdminMonitorPoller>();
 builder.Services.AddAuthorization();
 builder.Services.AddOptions<AuthorizationOptions>().Configure<AdminAccess>((options, admins) =>
     options.AddPolicy(AdminAccess.Policy, policy => policy.RequireAuthenticatedUser()
         .RequireAssertion(context => admins.Allows(context.User))));
-builder.Services.AddHealthChecks().AddCheck<DatabaseReadinessCheck>("database", tags: ["ready"]);
+builder.Services.AddHealthChecks()
+    .AddCheck("api", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy())
+    .AddCheck<DatabaseReadinessCheck>("database", tags: ["ready"]);
 
 var app = builder.Build();
 

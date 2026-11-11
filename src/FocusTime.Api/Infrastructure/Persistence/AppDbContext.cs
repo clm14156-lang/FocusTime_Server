@@ -1,3 +1,4 @@
+using FocusTime.Api.Modules.AccountSecurity;
 using FocusTime.Api.Modules.Identity;
 using FocusTime.Api.Modules.Admin;
 using FocusTime.Api.Modules.FocusSync;
@@ -11,6 +12,9 @@ namespace FocusTime.Api.Infrastructure.Persistence;
 public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
     : IdentityUserContext<AppUser, Guid>(options)
 {
+    public DbSet<SecurityChallenge> SecurityChallenges => Set<SecurityChallenge>();
+    public DbSet<AccountSecurityAudit> AccountSecurityAudits => Set<AccountSecurityAudit>();
+    public DbSet<SecurityNotification> SecurityNotifications => Set<SecurityNotification>();
     public DbSet<EmailChallenge> EmailChallenges => Set<EmailChallenge>();
     public DbSet<LoginDevice> LoginDevices => Set<LoginDevice>();
     public DbSet<LoginSession> LoginSessions => Set<LoginSession>();
@@ -24,13 +28,75 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
     public DbSet<MembershipAudit> MembershipAudits => Set<MembershipAudit>();
     public DbSet<MembershipOrder> MembershipOrders => Set<MembershipOrder>();
     public DbSet<MembershipOrderEvent> MembershipOrderEvents => Set<MembershipOrderEvent>();
+    public DbSet<MembershipOrderRefund> MembershipOrderRefunds => Set<MembershipOrderRefund>();
     public DbSet<MembershipPlan> MembershipPlans => Set<MembershipPlan>();
 
     public DbSet<AdminSecurityAudit> AdminSecurityAudits => Set<AdminSecurityAudit>();
+    public DbSet<AdminOperationLog> AdminOperationLogs => Set<AdminOperationLog>();
+    public DbSet<AdminNotification> AdminNotifications => Set<AdminNotification>();
+    public DbSet<AdminNotificationRead> AdminNotificationReads => Set<AdminNotificationRead>();
+    public DbSet<AdminMembershipAdjustment> AdminMembershipAdjustments => Set<AdminMembershipAdjustment>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
         base.OnModelCreating(builder);
+        AccountSecurityModel.Configure(builder);
+        builder.Entity<AdminNotification>(entity =>
+        {
+            entity.ToTable("notifications", "admin");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Kind).HasMaxLength(16);
+            entity.Property(x => x.Service).HasMaxLength(16);
+            entity.Property(x => x.Description).HasMaxLength(512);
+            entity.HasIndex(x => new { x.OccurredAtUtc, x.Id });
+            entity.HasIndex(x => x.MonitorIncidentId).IsUnique();
+            entity.HasIndex(x => x.HandledAtUtc).HasFilter("\"HandledAtUtc\" IS NULL");
+        });
+        builder.Entity<AdminNotificationRead>(entity =>
+        {
+            entity.ToTable("notification_reads", "admin");
+            entity.HasKey(x => new { x.AdministratorId, x.NotificationId });
+            entity.HasOne<AdminNotification>().WithMany().HasForeignKey(x => x.NotificationId).OnDelete(DeleteBehavior.Cascade);
+        });
+        builder.Entity<AdminOperationLog>(entity =>
+        {
+            entity.ToTable("operation_logs", "admin");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Administrator).HasMaxLength(256);
+            entity.Property(x => x.Category).HasMaxLength(16);
+            entity.Property(x => x.Action).HasMaxLength(128);
+            entity.Property(x => x.TargetId).HasMaxLength(128);
+            entity.Property(x => x.Target).HasMaxLength(256);
+            entity.Property(x => x.Source).HasMaxLength(64);
+            entity.Property(x => x.Ip).HasMaxLength(64);
+            entity.Property(x => x.Status).HasMaxLength(16);
+            entity.Property(x => x.FailureCode).HasMaxLength(64);
+            entity.Property(x => x.ChangesJson).HasColumnType("jsonb");
+            entity.HasIndex(x => new { x.OccurredAtUtc, x.Id });
+            entity.HasIndex(x => new { x.Category, x.Status, x.OccurredAtUtc });
+            // Keep historical actor identity even when an account is later removed.
+        });
+        builder.Entity<AdminMembershipAdjustment>(entity =>
+        {
+            entity.ToTable("admin_adjustments", "membership");
+            entity.HasKey(x => new { x.UserId, x.OperationId });
+            entity.Property(x => x.RequestHash).HasMaxLength(64);
+            entity.Property(x => x.ExpectedFingerprint).HasMaxLength(64);
+            entity.Property(x => x.Action).HasMaxLength(16);
+            entity.Property(x => x.Plan).HasMaxLength(16);
+            entity.Property(x => x.Scope).HasMaxLength(16);
+            entity.Property(x => x.ReasonCode).HasMaxLength(32);
+            entity.Property(x => x.Note).HasMaxLength(400);
+            entity.Property(x => x.State).HasMaxLength(16);
+            entity.Property(x => x.BeforeJson).HasColumnType("jsonb");
+            entity.Property(x => x.AfterJson).HasColumnType("jsonb");
+            entity.Property(x => x.TargetGrantIdsJson).HasColumnType("jsonb");
+            entity.HasIndex(x => new { x.UserId, x.AppliedAtUtc });
+            entity.HasIndex(x => x.OperationId).IsUnique();
+            entity.HasIndex(x => x.GrantId).IsUnique();
+            entity.HasOne<AppUser>().WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne<AppUser>().WithMany().HasForeignKey(x => x.ActorUserId).OnDelete(DeleteBehavior.Restrict);
+        });
         builder.Entity<MembershipPlan>(entity =>
         {
             entity.ToTable("plans", "membership", table => table.HasCheckConstraint("ck_plan_terms",
@@ -69,8 +135,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
             entity.ToTable("orders", "membership", table =>
             {
                 table.HasCheckConstraint("ck_order_terms", "\"Plan\" IN ('monthly', 'annual', 'lifetime') AND \"AmountFen\" > 0 AND \"Method\" IN ('wechat', 'alipay') AND \"ExpiresAtUtc\" > \"CreatedAtUtc\"");
-                table.HasCheckConstraint("ck_order_payment", "(\"Status\" = 'pending' AND \"PaidAtUtc\" IS NULL) OR (\"Status\" = 'paid' AND \"PaidAtUtc\" IS NOT NULL AND \"PaidAtUtc\" >= \"CreatedAtUtc\" AND \"PaidAtUtc\" < \"ExpiresAtUtc\")");
-                table.HasCheckConstraint("ck_order_activation", "(\"ActivationStatus\" IN ('notStarted', 'failed') AND \"MembershipGrantId\" IS NULL AND \"ActivatedAtUtc\" IS NULL) OR (\"Status\" = 'paid' AND \"ActivationStatus\" = 'activated' AND \"MembershipGrantId\" IS NOT NULL AND \"ActivatedAtUtc\" IS NOT NULL)");
+                table.HasCheckConstraint("ck_order_payment", "(\"Status\" = 'pending' AND \"PaidAtUtc\" IS NULL) OR (\"Status\" IN ('paid', 'refunding', 'refunded') AND \"PaidAtUtc\" IS NOT NULL AND \"PaidAtUtc\" >= \"CreatedAtUtc\" AND \"PaidAtUtc\" < \"ExpiresAtUtc\")");
+                table.HasCheckConstraint("ck_order_activation", "(\"ActivationStatus\" IN ('notStarted', 'failed') AND \"MembershipGrantId\" IS NULL AND \"ActivatedAtUtc\" IS NULL) OR (\"Status\" IN ('paid', 'refunding', 'refunded') AND \"ActivationStatus\" = 'activated' AND \"MembershipGrantId\" IS NOT NULL AND \"ActivatedAtUtc\" IS NOT NULL)");
                 table.HasCheckConstraint("ck_order_duration_snapshot", "(\"Plan\" = 'lifetime' AND \"DurationDays\" IS NULL AND \"DurationMonths\" IS NULL) OR (\"Plan\" <> 'lifetime' AND ((\"DurationDays\" > 0 AND \"DurationDays\" IS NOT NULL AND \"DurationMonths\" IS NULL) OR (\"DurationMonths\" > 0 AND \"DurationMonths\" IS NOT NULL AND \"DurationDays\" IS NULL)))");
             });
             entity.HasKey(x => x.Id);
@@ -89,6 +155,21 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
             entity.HasIndex(x => new { x.PaymentProvider, x.PaymentReference }).IsUnique();
             entity.HasOne<MembershipGrant>().WithMany().HasForeignKey(x => x.MembershipGrantId).OnDelete(DeleteBehavior.Restrict);
             entity.HasOne<AppUser>().WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        });
+        builder.Entity<MembershipOrderRefund>(entity =>
+        {
+            entity.ToTable("order_refunds", "membership", table => table.HasCheckConstraint("ck_refund_receipt",
+                "\"AmountFen\" > 0 AND \"Status\" = 'refunded' AND \"CompletedAtUtc\" >= \"CreatedAtUtc\""));
+            entity.HasKey(x => x.Id);
+            entity.HasIndex(x => x.OrderId).IsUnique();
+            entity.Property(x => x.RequestHash).HasMaxLength(64);
+            entity.Property(x => x.ReasonCode).HasMaxLength(32);
+            entity.Property(x => x.Note).HasMaxLength(200);
+            entity.Property(x => x.Status).HasMaxLength(16);
+            entity.Property(x => x.ProviderReference).HasMaxLength(128);
+            entity.HasOne<MembershipOrder>().WithOne().HasForeignKey<MembershipOrderRefund>(x => x.OrderId).OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne<AppUser>().WithMany().HasForeignKey(x => x.ActorUserId).OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne<MembershipGrant>().WithMany().HasForeignKey(x => x.RevokedGrantId).OnDelete(DeleteBehavior.Restrict);
         });
         builder.Entity<MembershipOrderEvent>(entity =>
         {

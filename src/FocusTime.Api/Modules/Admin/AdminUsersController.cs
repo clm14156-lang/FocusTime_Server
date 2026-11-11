@@ -39,9 +39,7 @@ public sealed record AdminUsersPage(IReadOnlyList<AdminUser> Items, int Total, i
     ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
 public sealed class AdminUsersController(AppDbContext db, TimeProvider clock) : ControllerBase
 {
-    // Identity supports finite lockouts and permanent (+infinity) lockouts. There is no soft-delete
-    // state in this schema; deleted users are never reconstructed from orders, sessions or audits.
-    public const string StatusNote = "已禁用依据 Identity 永久锁定；临时锁定单独显示。当前后端无注销状态字段，不推测或恢复已删除账号。";
+    public const string StatusNote = "已禁用、暂时锁定和已注销根据账号的实际状态统计。";
     private static readonly TimeSpan Offset = TimeSpan.FromHours(8);
 
     [HttpGet]
@@ -98,7 +96,7 @@ public sealed class AdminUsersController(AppDbContext db, TimeProvider clock) : 
             .OrderByDescending(g => g.Kind == "lifetime").ThenByDescending(g => g.ExpiresAtUtc).ThenBy(g => g.Id)
             .Take(1).DefaultIfEmpty()
         select new AdminUser {
-            Id = user.Id, Email = user.Email!, Status = user.LockoutEnabled && user.LockoutEnd > now
+            Id = user.Id, Email = user.Email!, Status = user.ClosedAtUtc != null ? "deleted" : user.LockoutEnabled && user.LockoutEnd > now
                 ? user.LockoutEnd == DateTimeOffset.MaxValue ? "disabled" : "locked" : "active",
             RegisteredAtUtc = user.CreatedAtUtc,
             LastLoginAtUtc = db.LoginSessions.Where(s => s.UserId == user.Id).Max(s => (DateTimeOffset?)s.CreatedAtUtc),

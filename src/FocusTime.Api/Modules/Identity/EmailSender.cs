@@ -6,11 +6,28 @@ namespace FocusTime.Api.Modules.Identity;
 public interface IEmailSender
 {
     Task SendCodeAsync(string email, string purpose, string code, CancellationToken cancellationToken);
+    Task SendSecurityNoticeAsync(string email, string subject, string body, CancellationToken cancellationToken);
 }
 
 public sealed class EmailSender(IConfiguration configuration, IHostEnvironment environment, ILogger<EmailSender> logger) : IEmailSender
 {
     public async Task SendCodeAsync(string email, string purpose, string code, CancellationToken cancellationToken)
+    {
+        if (environment.IsDevelopment() && string.Equals(configuration["Email:Mode"], "Log", StringComparison.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            logger.LogInformation("Development email code for {Email} ({Purpose}): {Code}", email, purpose, code);
+            return;
+        }
+        await SendAsync(email, purpose switch { "register" => "FocusTime 注册验证码", "reset" => "FocusTime 密码重置验证码",
+            "closure" => "FocusTime 注销账号验证码", _ => "FocusTime 修改登录邮箱验证码" },
+            $"您的验证码是：{code}。10 分钟内有效，请勿向他人提供。如非本人操作，请忽略此邮件。", cancellationToken);
+    }
+
+    public Task SendSecurityNoticeAsync(string email, string subject, string body, CancellationToken cancellationToken) =>
+        SendAsync(email, subject, body, cancellationToken);
+
+    private async Task SendAsync(string email, string subject, string body, CancellationToken cancellationToken)
     {
         var mode = configuration["Email:Mode"];
         if (string.Equals(mode, "Log", StringComparison.OrdinalIgnoreCase))
@@ -18,11 +35,9 @@ public sealed class EmailSender(IConfiguration configuration, IHostEnvironment e
             if (!environment.IsDevelopment())
                 throw new AuthFault(503, "email_unavailable", "Development email delivery is unavailable.");
             cancellationToken.ThrowIfCancellationRequested();
-            logger.LogInformation("Development email code for {Email} ({Purpose}): {Code}", email, purpose, code);
+            logger.LogInformation("Development email delivery requested: {Subject}", subject);
             return;
         }
-        var subject = purpose == "register" ? "FocusTime 注册验证码" : "FocusTime 密码重置验证码";
-        var body = $"您的验证码是：{code}。10 分钟内有效，请勿向他人提供。";
         if (environment.IsDevelopment() && mode == "Pickup")
         {
             var folder = configuration["Email:PickupDirectory"] ??
