@@ -124,6 +124,8 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<AuthSecurity>();
 builder.Services.AddScoped<IEmailSender, EmailSender>();
 builder.Services.AddScoped<AccountService>();
+builder.Services.AddScoped<LoginProtection>();
+builder.Services.AddHostedService<LoginProtectionCleanup>();
 builder.Services.AddScoped<AccountSecurityService>();
 builder.Services.AddScoped<SecurityNotificationDispatcher>();
 builder.Services.AddHostedService<SecurityNotificationWorker>();

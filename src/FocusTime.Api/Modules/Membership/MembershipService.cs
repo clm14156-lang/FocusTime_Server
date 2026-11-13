@@ -24,14 +24,26 @@ public sealed class MembershipService(AppDbContext db, TimeProvider clock)
             await db.AdminMembershipAdjustments.AsNoTracking().AnyAsync(x => x.UserId == userId &&
                 x.GrantId == grant.Id && x.State == "applied" && x.Action == "grant" && x.ReasonCode == "trial" &&
                 !db.MembershipOrders.Any(order => order.MembershipGrantId == grant.Id), ct);
+        DateTimeOffset? lastExpiredAt = grant is not null ? null : await db.MembershipGrants.AsNoTracking()
+            .Where(x => x.UserId == userId && x.RevokedAtUtc == null && x.ExpiresAtUtc <= now)
+            .MaxAsync(x => x.ExpiresAtUtc, ct);
         return new(grant is null ? MembershipKind.Normal : grant.Kind == "lifetime" ? MembershipKind.Lifetime : MembershipKind.Annual,
             grant is not null, grant?.StartsAtUtc, grant?.ExpiresAtUtc, version,
             grant is null ? [] : [EntitlementCodes.ForcedMode, EntitlementCodes.AutomaticBlocking], now)
-        { Plan = grant?.Kind ?? "normal", IsTrial = isTrial };
+        {
+            Plan = grant?.Kind ?? "normal",
+            IsTrial = isTrial,
+            State = grant is not null ? "active" : lastExpiredAt.HasValue ? "expired" : "normal",
+            LastExpiredAtUtc = lastExpiredAt
+        };
     }
 
-    public async Task<UserProfile> ApplyAsync(UserProfile profile, CancellationToken ct) => profile with
-    { Membership = profile.EmailConfirmed ? (await GetAsync(profile.Id, ct)).Kind.ToString().ToLowerInvariant() : "normal" };
+    public async Task<UserProfile> ApplyAsync(UserProfile profile, CancellationToken ct)
+    {
+        if (!profile.EmailConfirmed) return profile;
+        var status = await GetAsync(profile.Id, ct);
+        return profile with { Membership = status.Kind.ToString().ToLowerInvariant(), MembershipVersion = status.Version };
+    }
 
     public async Task<MembershipAudit> ChangeAsync(Guid userId, Guid operationId, string action, string kind,
         DateTimeOffset starts, DateTimeOffset? expires, Guid? grantId, string reason, string actor, CancellationToken ct = default)

@@ -16,6 +16,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
     public DbSet<AccountSecurityAudit> AccountSecurityAudits => Set<AccountSecurityAudit>();
     public DbSet<SecurityNotification> SecurityNotifications => Set<SecurityNotification>();
     public DbSet<EmailChallenge> EmailChallenges => Set<EmailChallenge>();
+    public DbSet<LoginAttempt> LoginAttempts => Set<LoginAttempt>();
+    public DbSet<LoginCaptcha> LoginCaptchas => Set<LoginCaptcha>();
     public DbSet<LoginDevice> LoginDevices => Set<LoginDevice>();
     public DbSet<LoginSession> LoginSessions => Set<LoginSession>();
     public DbSet<RefreshCredential> RefreshCredentials => Set<RefreshCredential>();
@@ -232,6 +234,22 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
             entity.Property(x => x.TicketHash).HasMaxLength(64);
             entity.HasIndex(x => new { x.Email, x.Purpose, x.CreatedAtUtc });
             entity.HasIndex(x => x.TicketHash).IsUnique();
+        });
+        builder.Entity<LoginAttempt>(entity =>
+        {
+            entity.ToTable("login_attempts", "identity");
+            entity.HasKey(x => x.AccountKey);
+            entity.Property(x => x.AccountKey).HasMaxLength(64);
+            entity.HasIndex(x => x.WindowStartedAtUtc);
+        });
+        builder.Entity<LoginCaptcha>(entity =>
+        {
+            entity.ToTable("login_captchas", "identity");
+            entity.HasKey(x => new { x.AccountKey, x.InstallationId });
+            entity.Property(x => x.AccountKey).HasMaxLength(64);
+            entity.Property(x => x.AnswerHash).HasMaxLength(64);
+            entity.HasIndex(x => x.ExpiresAtUtc);
+            entity.HasOne<LoginAttempt>().WithMany().HasForeignKey(x => x.AccountKey).OnDelete(DeleteBehavior.Cascade);
         });
         builder.Entity<LoginDevice>(entity =>
         {

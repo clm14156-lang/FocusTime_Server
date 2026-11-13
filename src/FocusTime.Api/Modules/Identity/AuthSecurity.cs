@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using FocusTime.Api.Modules.Identity.Contracts;
 
 namespace FocusTime.Api.Modules.Identity;
 
@@ -8,6 +9,7 @@ public sealed class AuthFault(int status, string code, string message, int? retr
     public int Status { get; } = status;
     public string Code { get; } = code;
     public int? RetryAfterSeconds { get; } = retryAfterSeconds;
+    public LoginCaptchaResponse? Captcha { get; init; }
 }
 
 public sealed class AuthSecurity(IConfiguration configuration, IHostEnvironment environment)

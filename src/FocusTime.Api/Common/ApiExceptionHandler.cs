@@ -16,6 +16,7 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : I
             var problem = new ProblemDetails { Status = fault.Status, Title = fault.Message };
             ApiProblems.Enrich(context, problem);
             problem.Extensions["code"] = fault.Code;
+            if (fault.Captcha is { } captcha) problem.Extensions["captcha"] = captcha;
             context.Response.StatusCode = fault.Status;
             context.Response.Headers.CacheControl = "no-store";
             if (fault.Status == 429) context.Response.Headers.RetryAfter =

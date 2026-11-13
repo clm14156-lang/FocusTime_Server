@@ -9,7 +9,7 @@ using Microsoft.EntityFrameworkCore;
 namespace FocusTime.Api.Modules.Identity;
 
 public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, AuthSecurity security,
-    IEmailSender mail, TimeProvider clock, ILogger<AccountService> logger)
+    IEmailSender mail, TimeProvider clock, ILogger<AccountService> logger, LoginProtection loginProtection)
 {
     // PostgreSQL timestamps have microsecond precision. Milliseconds also make replay responses exact.
     private DateTimeOffset Now => DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds());
@@ -127,6 +127,22 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         return Response(session, user, access, refresh!);
     }
 
+    public async Task<LoginCaptchaResponse> RefreshLoginCaptchaAsync(RefreshLoginCaptchaRequest request, CancellationToken ct)
+    {
+        if (request.InstallationId == Guid.Empty)
+            throw new AuthFault(400, "invalid_device", "InstallationId is required.");
+        var email = Normalize(request.Email);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(email, ct);
+        var attempt = await loginProtection.BeginRequestAsync(email, ct);
+        var captcha = loginProtection.RequiresCaptcha(attempt)
+            ? await loginProtection.IssueAsync(attempt, request.InstallationId, ct)
+            : null;
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+        return captcha ?? throw new AuthFault(409, "captcha_not_required", "Sign in again to continue.");
+    }
+
     public async Task<(UserProfile User, string AccessToken, DateTimeOffset ExpiresAtUtc)> LoginAdministratorAsync(
         LoginRequest request, Func<Guid, bool> allows, CancellationToken ct)
     {
@@ -141,31 +157,51 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         if (request.Device.InstallationId == Guid.Empty)
             throw new AuthFault(400, "invalid_device", "InstallationId is required.");
         await using var tx = await db.Database.BeginTransactionAsync(ct);
-        await LockAsync(request.Email, ct);
-        var user = await users.FindByEmailAsync(Normalize(request.Email));
-        if (user is null || user.ClosedAtUtc is not null)
+        var email = Normalize(request.Email);
+        await LockAsync(email, ct);
+        var attempt = allowsAdministrator is null ? await loginProtection.BeginRequestAsync(email, ct) : null;
+        if (attempt is not null && await loginProtection.CheckAsync(attempt, request, ct) is { } captchaFault)
+            throw await RejectAsync(captchaFault);
+
+        var user = await users.FindByEmailAsync(email);
+        // The administrator endpoint must not validate passwords for ordinary accounts.
+        if (user is null || user.ClosedAtUtc is not null || (allowsAdministrator is not null && !allowsAdministrator(user.Id)))
         {
             // Match the expensive password hash path for unknown accounts.
             _ = users.PasswordHasher.HashPassword(new AppUser(), request.Password);
-            throw new AuthFault(401, "invalid_credentials", "Email or password is incorrect.");
+            throw await InvalidCredentialsAsync();
         }
         if (user.LockoutEnabled && user.LockoutEnd == DateTimeOffset.MaxValue)
-            throw new AuthFault(403, "account_disabled", "This account has been disabled.");
+            throw await RejectAsync(new AuthFault(403, "account_disabled", "This account has been disabled."));
         if (await users.IsLockedOutAsync(user))
-            throw new AuthFault(429, "account_locked", "Too many failed attempts. Try again later.",
-                Math.Max(1, (int)Math.Ceiling(((user.LockoutEnd ?? Now.AddMinutes(15)) - Now).TotalSeconds)));
+            throw await RejectAsync(new AuthFault(429, "account_locked", "Too many failed attempts. Try again later.",
+                Math.Max(1, (int)Math.Ceiling(((user.LockoutEnd ?? Now.AddMinutes(15)) - Now).TotalSeconds))));
         if (!await users.CheckPasswordAsync(user, request.Password) || !user.EmailConfirmed)
         {
             Check(await users.AccessFailedAsync(user));
-            await tx.CommitAsync(ct);
-            throw new AuthFault(401, "invalid_credentials", "Email or password is incorrect.");
+            throw await InvalidCredentialsAsync();
         }
-        if (allowsAdministrator is not null && !allowsAdministrator(user.Id))
-            throw new AuthFault(403, "administrator_required", "This account cannot access the administration site.");
         Check(await users.ResetAccessFailedCountAsync(user));
-        var (session, access, refresh) = await CreateSessionAsync(user, request.Device, allowsAdministrator is not null, ct);
+        if (attempt is not null) loginProtection.ResetFailures(attempt);
+        (LoginSession session, string access, string? refresh) credentials;
+        try { credentials = await CreateSessionAsync(user, request.Device, allowsAdministrator is not null, ct); }
+        catch (AuthFault fault) when (attempt is not null && fault.Code == "session_limit_reached")
+        { throw await RejectAsync(fault); }
         await tx.CommitAsync(ct);
-        return (session, user, access, refresh);
+        return (credentials.session, user, credentials.access, credentials.refresh);
+
+        async Task<AuthFault> RejectAsync(AuthFault fault)
+        {
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            return fault;
+        }
+
+        async Task<AuthFault> InvalidCredentialsAsync()
+        {
+            var captcha = attempt is null ? null : await loginProtection.RecordFailureAsync(attempt, request.Device.InstallationId, ct);
+            return await RejectAsync(new AuthFault(401, "invalid_credentials", "Email or password is incorrect.") { Captcha = captcha });
+        }
     }
 
     private async Task<(LoginSession Session, string Access, string? Refresh)> CreateSessionAsync(

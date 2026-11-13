@@ -36,6 +36,10 @@ public sealed class AuthController(AccountService accounts, AppDbContext db, Mem
         return response with { User = await memberships.ApplyAsync(response.User, ct) };
     }
 
+    [HttpPost("login/captcha")]
+    public Task<LoginCaptchaResponse> RefreshLoginCaptcha(RefreshLoginCaptchaRequest request, CancellationToken ct) =>
+        accounts.RefreshLoginCaptchaAsync(request, ct);
+
     [HttpPost("refresh")]
     public async Task<TokenResponse> Refresh(RefreshRequest request, CancellationToken ct)
     {

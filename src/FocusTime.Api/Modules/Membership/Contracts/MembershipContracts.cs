@@ -6,6 +6,8 @@ public sealed record MembershipResponse(MembershipKind Kind, bool IsActive, Date
 {
     public string Plan { get; init; } = "normal";
     public bool IsTrial { get; init; }
+    public string State { get; init; } = "normal";
+    public DateTimeOffset? LastExpiredAtUtc { get; init; }
 }
 public sealed record EntitlementLeaseResponse(string Token, DateTimeOffset ExpiresAtUtc, string KeyId);
 

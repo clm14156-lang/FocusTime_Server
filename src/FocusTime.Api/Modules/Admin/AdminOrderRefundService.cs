@@ -83,21 +83,22 @@ public sealed class AdminOrderRefundService(AppDbContext db, MembershipService m
             throw new AuthFault(409, info.BlockReason ?? "refund_unavailable", "This order cannot be refunded.");
         if (request.AmountFen > purchase.AmountFen)
             throw new AuthFault(400, "refund_amount_exceeds_payment", "Refund amount cannot exceed the payment.");
-        if (grant is not null && grant.UserId != purchase.UserId || request.RevokeMembership && purchase.MembershipGrantId.HasValue && grant is null)
+        var revokeMembership = request.RevokeMembership || request.AmountFen == purchase.AmountFen;
+        if (grant is not null && grant.UserId != purchase.UserId || revokeMembership && purchase.MembershipGrantId.HasValue && grant is null)
             throw new AuthFault(409, "refund_grant_binding_invalid", "The order grant binding cannot be verified.");
-        if (request.RevokeMembership && grant is not null && await db.MembershipOrders.AsNoTracking()
+        if (revokeMembership && grant is not null && await db.MembershipOrders.AsNoTracking()
             .AnyAsync(x => x.Id != purchase.Id && x.MembershipGrantId == grant.Id, ct))
             throw new AuthFault(409, "refund_grant_binding_invalid", "The membership grant is shared by another order.");
         var refund = new MembershipOrderRefund { Id = request.OperationId, OrderId = purchase.Id, ActorUserId = actorId,
             RequestHash = hash, AmountFen = request.AmountFen, ReasonCode = request.ReasonCode, Note = note,
-            RevokeMembership = request.RevokeMembership, ProviderReference = $"SIMREF{request.OperationId:N}", CreatedAtUtc = now, CompletedAtUtc = now };
+            RevokeMembership = revokeMembership, ProviderReference = $"SIMREF{request.OperationId:N}", CreatedAtUtc = now, CompletedAtUtc = now };
         // This adapter handles persisted simulation payments only. No provider call or real-money success is fabricated.
         purchase.Status = "refunded";
         db.MembershipOrderRefunds.Add(refund);
         var orderActor = "admin:" + actorId;
         db.MembershipOrderEvents.Add(new() { OrderId = purchase.Id, Kind = "refund_requested", Actor = orderActor, OccurredAtUtc = now });
         db.MembershipOrderEvents.Add(new() { OrderId = purchase.Id, Kind = "refund_completed", Actor = orderActor, OccurredAtUtc = now });
-        if (request.RevokeMembership && grant is not null && grant.RevokedAtUtc is null)
+        if (revokeMembership && grant is not null && grant.RevokedAtUtc is null)
         {
             var revokeOperation = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes($"order-refund:{request.OperationId:N}"))[..16]);
             await memberships.StageChangeAsync(purchase.UserId, revokeOperation, "revoke", "", DateTimeOffset.UnixEpoch, null,

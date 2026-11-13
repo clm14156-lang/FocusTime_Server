@@ -685,6 +685,32 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
                     b.ToTable("email_challenges", "identity");
                 });
 
+            modelBuilder.Entity("FocusTime.Api.Modules.Identity.LoginAttempt", b =>
+                {
+                    b.Property<string>("AccountKey").HasMaxLength(64).HasColumnType("character varying(64)");
+                    b.Property<int>("ConsecutiveFailures").HasColumnType("integer");
+                    b.Property<DateTimeOffset?>("LastFailureAtUtc").HasColumnType("timestamp with time zone");
+                    b.Property<int>("RequestCount").HasColumnType("integer");
+                    b.Property<DateTimeOffset>("WindowStartedAtUtc").HasColumnType("timestamp with time zone");
+
+                    b.HasKey("AccountKey");
+                    b.HasIndex("WindowStartedAtUtc");
+                    b.ToTable("login_attempts", "identity");
+                });
+
+            modelBuilder.Entity("FocusTime.Api.Modules.Identity.LoginCaptcha", b =>
+                {
+                    b.Property<string>("AccountKey").HasMaxLength(64).HasColumnType("character varying(64)");
+                    b.Property<Guid>("InstallationId").HasColumnType("uuid");
+                    b.Property<string>("AnswerHash").IsRequired().HasMaxLength(64).HasColumnType("character varying(64)");
+                    b.Property<Guid>("ChallengeId").HasColumnType("uuid");
+                    b.Property<DateTimeOffset>("ExpiresAtUtc").HasColumnType("timestamp with time zone");
+
+                    b.HasKey("AccountKey", "InstallationId");
+                    b.HasIndex("ExpiresAtUtc");
+                    b.ToTable("login_captchas", "identity");
+                });
+
             modelBuilder.Entity("FocusTime.Api.Modules.Identity.LoginDevice", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1290,6 +1316,15 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
                     b.HasOne("FocusTime.Api.Modules.Identity.AppUser", null)
                         .WithMany()
                         .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("FocusTime.Api.Modules.Identity.LoginCaptcha", b =>
+                {
+                    b.HasOne("FocusTime.Api.Modules.Identity.LoginAttempt", null)
+                        .WithMany()
+                        .HasForeignKey("AccountKey")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

@@ -12,7 +12,8 @@ namespace FocusTime.Api.Modules.Membership;
 public sealed record EntitlementLeaseRequest(
     [param: Required, RegularExpression("^[a-f0-9]{64}$")] string ApiScope,
     [param: Required, RegularExpression("^[a-f0-9]{64}$")] string MachineBinding,
-    [param: Required, RegularExpression("^[a-f0-9]{64}$")] string Nonce);
+    [param: Required, RegularExpression("^[a-f0-9]{64}$")] string Nonce,
+    [param: Range(1, 7)] int MaxLeaseDays = 3);
 
 [ApiController, Authorize, Route("api/v1"), ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
 public sealed class MembershipController(AppDbContext db, MembershipService memberships, EntitlementSigner signer, TimeProvider clock) : ControllerBase
@@ -35,14 +36,17 @@ public sealed class MembershipController(AppDbContext db, MembershipService memb
         var session = await LockSessionAsync(ct);
         var device = await db.LoginDevices.AsNoTracking().SingleAsync(x => x.Id == session.DeviceId && x.UserId == session.UserId, ct);
         var status = await memberships.GetAsync(session.UserId, ct);
-        var now = clock.GetUtcNow();
-        var expires = new[] { now.AddHours(72), session.ExpiresAtUtc, status.ExpiresAtUtc ?? DateTimeOffset.MaxValue }.Min();
+        var now = status.ServerTimeUtc;
+        // Older clients only accept proofs up to three days.
+        var expires = new[] { now.AddDays(status.IsActive ? request.MaxLeaseDays : 1), session.ExpiresAtUtc,
+            status.ExpiresAtUtc ?? DateTimeOffset.MaxValue }.Min();
         var token = signer.Sign(new
         {
             v = 1, iss = "FocusTime_Server", aud = "focusapp-service", sub = session.UserId.ToString("D"),
             deviceId = device.Id.ToString("D"), sessionId = session.Id.ToString("D"), installationId = device.InstallationId.ToString("D"),
             apiScope = request.ApiScope, machineBinding = request.MachineBinding, nonce = request.Nonce,
             kind = status.Kind.ToString().ToLowerInvariant(), rights = status.Entitlements, version = status.Version,
+            plan = status.Plan, state = status.State, lastExpiredAt = status.LastExpiredAtUtc?.ToUnixTimeSeconds(),
             iat = now.ToUnixTimeSeconds(), exp = expires.ToUnixTimeSeconds(),
             sessionExp = session.ExpiresAtUtc.ToUnixTimeSeconds(), grantExp = status.ExpiresAtUtc?.ToUnixTimeSeconds()
         });

@@ -13,12 +13,18 @@ public sealed record RegisterRequest(
 public sealed record LoginRequest(
     [param: Required, EmailAddress, MaxLength(256)] string Email,
     [param: Required, MaxLength(128)] string Password,
-    [param: Required] DeviceRegistration Device);
+    [param: Required] DeviceRegistration Device,
+    Guid? CaptchaChallengeId = null,
+    [param: MaxLength(32)] string? CaptchaCode = null);
+public sealed record RefreshLoginCaptchaRequest(
+    [param: Required, EmailAddress, MaxLength(256)] string Email, Guid InstallationId);
+public sealed record LoginCaptchaResponse(Guid ChallengeId, byte[] Image, DateTimeOffset ExpiresAtUtc);
 public sealed record RefreshRequest([param: Required, MaxLength(512)] string RefreshToken, Guid RequestId);
 public sealed record LogoutRequest([param: Required, MaxLength(512)] string RefreshToken);
 public sealed record UserProfile(Guid Id, string Email, bool EmailConfirmed)
 {
     public string Membership { get; init; } = "normal";
+    public long? MembershipVersion { get; init; }
 }
 public sealed record TokenResponse(string TokenType, string AccessToken, DateTimeOffset AccessTokenExpiresAtUtc,
     string RefreshToken, DateTimeOffset RefreshTokenExpiresAtUtc, Guid SessionId, Guid DeviceId, UserProfile User);
