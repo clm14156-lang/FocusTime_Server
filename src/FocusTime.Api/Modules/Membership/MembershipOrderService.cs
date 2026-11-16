@@ -1,5 +1,6 @@
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity;
+using FocusTime.Api.Modules.Admin;
 using FocusTime.Api.Modules.Sessions;
 using Microsoft.EntityFrameworkCore;
 
@@ -67,6 +68,7 @@ public sealed class MembershipOrderService(AppDbContext db, MembershipService me
                 order.ActivationAttemptedAtUtc = clock.GetUtcNow();
                 order.ActivationErrorCode = "membership_activation_failed";
                 Record(order, "membership_activation_failed", actor);
+                await AdminNotificationCollector.StageOrderFailureAsync(db, order, order.ActivationAttemptedAtUtc.Value, ct);
                 await db.SaveChangesAsync(ct);
                 logger.LogError(error, "Membership fulfillment failed for order {OrderId}.", orderId);
             }

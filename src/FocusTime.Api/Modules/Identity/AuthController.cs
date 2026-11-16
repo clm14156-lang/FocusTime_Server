@@ -25,8 +25,7 @@ public sealed class AuthController(AccountService accounts, AppDbContext db, Mem
         // Existing clients without a device retain their registration response.
         if (request.Device is null)
             return StatusCode(201, await memberships.ApplyAsync(await accounts.RegisterAsync(request, ct), ct));
-        var response = await accounts.RegisterWithSessionAsync(request, ct);
-        return StatusCode(201, response with { User = await memberships.ApplyAsync(response.User, ct) });
+        return StatusCode(201, await accounts.RegisterWithSessionAsync(request, ct));
     }
 
     [HttpPost("login")]

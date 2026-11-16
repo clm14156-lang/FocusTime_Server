@@ -1,13 +1,28 @@
 #requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess)]
-param([ValidateSet(5080, 5082)][int]$Port = 5082)
+param(
+    [ValidateSet(5080, 5082)][int]$Port = 5082,
+    [switch]$ShowRequests
+)
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'LocalServices.Common.ps1')
+
+function Open-RequestWindow([string]$LogPath) {
+    $watcher = Join-Path $PSScriptRoot 'Watch-LocalApiRequests.ps1'
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -NoExit -File "{0}" -Port {1}' -f $watcher, $Port
+    if ($LogPath) { $arguments += ' -LogPath "{0}"' -f $LogPath }
+    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $arguments -WindowStyle Normal
+}
+
 $settings = Get-LocalServiceSettings
 $api = Get-LocalApiSettings $settings $Port
 if (Get-LocalApiProcess $settings $api) {
     Write-Output "FocusTime API is already listening at $($api.BaseUrl)."
+    if ($ShowRequests -and $PSCmdlet.ShouldProcess($api.BaseUrl, 'Open request log window')) {
+        Open-RequestWindow
+    }
     return
 }
 if (-not (Test-LocalDatabaseRunning $settings)) {
@@ -38,6 +53,7 @@ $environment = @{
     Authentication__Secret = $null
     AdminOverview__UserIds__0 = $null
 }
+if ($ShowRequests) { $environment.RequestTracing__LogAll = 'true' }
 if ($Port -eq 5082) {
     $admin = Get-Content -LiteralPath $settings.AdministratorFile -Raw | ConvertFrom-Json
     $environment.AdminOverview__UserIds__0 = ([guid]$admin.UserId).ToString()
@@ -100,3 +116,4 @@ try {
     throw
 }
 Write-Output "FocusTime API is ready: $readyUrl"
+if ($ShowRequests) { Open-RequestWindow $stdout }

@@ -2,6 +2,8 @@ namespace FocusTime.Api.Modules.Membership;
 
 public sealed class MembershipPlan
 {
+    public const int MonthlyDurationDays = 30;
+
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public int AmountFen { get; set; }

@@ -8,7 +8,8 @@ using Microsoft.EntityFrameworkCore;
 
 namespace FocusTime.Api.Modules.FocusSync;
 
-public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSecurity security)
+public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSecurity security,
+    SyncNotifications notifications, ILogger<FocusSyncService> logger)
 {
     private async Task<LoginSession> LockSessionAsync(Guid userId, Guid sessionId, CancellationToken ct)
     {
@@ -29,6 +30,12 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
         var session = await LockSessionAsync(userId, sessionId, ct);
         var state = await db.FocusSyncStates.SingleOrDefaultAsync(x => x.UserId == userId, ct);
         if (state is null) { state = new() { UserId = userId }; db.Add(state); }
+        var operationIds = request.Operations.Select(x => x.OperationId).Where(id => id != Guid.Empty).Distinct().ToArray();
+        var recordIds = request.Operations.Select(x => x.RecordId).Where(id => id != Guid.Empty).Distinct().ToArray();
+        var receipts = await db.FocusSyncReceipts.Where(x => x.UserId == userId && operationIds.Contains(x.OperationId))
+            .ToDictionaryAsync(x => x.OperationId, ct);
+        var records = await db.FocusRecords.Where(x => x.UserId == userId && recordIds.Contains(x.RecordId))
+            .ToDictionaryAsync(x => x.RecordId, ct);
         var results = new List<SyncOperationResult>();
         foreach (var operation in request.Operations)
         {
@@ -41,9 +48,7 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
             var payload = JsonSerializer.Serialize(record, FocusPayloadCodec.Json);
             var digest = AuthSecurity.Hash(JsonSerializer.Serialize(new
                 { operation.RecordId, operation.Kind, operation.BaseRevision, Record = record }, FocusPayloadCodec.Json));
-            var receipt = db.FocusSyncReceipts.Local.FirstOrDefault(x => x.UserId == userId && x.OperationId == operation.OperationId)
-                ?? await db.FocusSyncReceipts.SingleOrDefaultAsync(x => x.UserId == userId && x.OperationId == operation.OperationId, ct);
-            if (receipt is not null)
+            if (receipts.TryGetValue(operation.OperationId, out var receipt))
             {
                 results.Add(receipt.RequestHash != digest
                     ? new(operation.OperationId, operation.RecordId, SyncOperationStatus.Conflict, null, "operation_id_reused")
@@ -56,12 +61,11 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
             long? revision = null;
             if (code is null)
             {
-                var existing = db.FocusRecords.Local.FirstOrDefault(x => x.UserId == userId && x.RecordId == operation.RecordId)
-                    ?? await db.FocusRecords.SingleOrDefaultAsync(x => x.UserId == userId && x.RecordId == operation.RecordId, ct);
+                records.TryGetValue(operation.RecordId, out var existing);
                 var payloadHash = AuthSecurity.Hash(payload);
                 if (operation.Kind == SyncOperationKind.Delete)
                 {
-                    // Completed history is immutable: delete wins, including delete-before-upload.
+                    // A tombstone wins over pending edits, including a delete before the first upload.
                     if (existing?.IsDeleted == true)
                     { status = SyncOperationStatus.Duplicate; revision = existing.Revision; }
                     else
@@ -71,6 +75,7 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
                         {
                             existing = new() { UserId = userId, RecordId = operation.RecordId };
                             db.FocusRecords.Add(existing);
+                            records.Add(existing.RecordId, existing);
                         }
                         existing.SourceDeviceId = session.DeviceId;
                         existing.Revision = revision.Value;
@@ -84,8 +89,23 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
                 else if (existing is not null)
                 {
                     revision = existing.Revision;
-                    status = !existing.IsDeleted && existing.PayloadHash == payloadHash ? SyncOperationStatus.Duplicate : SyncOperationStatus.Conflict;
-                    code = status == SyncOperationStatus.Conflict ? existing.IsDeleted ? "record_deleted" : "record_conflict" : null;
+                    if (!existing.IsDeleted && existing.PayloadHash == payloadHash)
+                        status = SyncOperationStatus.Duplicate;
+                    else if (!existing.IsDeleted && operation.BaseRevision == existing.Revision)
+                    {
+                        revision = state.LastRevision = checked(state.LastRevision + 1);
+                        existing.SourceDeviceId = session.DeviceId;
+                        existing.Revision = revision.Value;
+                        existing.PayloadJson = payload;
+                        existing.PayloadHash = payloadHash;
+                        existing.ReceivedAtUtc = clock.GetUtcNow();
+                        AppendChange(existing);
+                    }
+                    else
+                    {
+                        status = SyncOperationStatus.Conflict;
+                        code = existing.IsDeleted ? "record_deleted" : "record_conflict";
+                    }
                 }
                 else if (operation.BaseRevision is not null)
                 { status = SyncOperationStatus.Conflict; code = "revision_conflict"; }
@@ -95,15 +115,22 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
                     var added = new FocusRecord { UserId = userId, RecordId = operation.RecordId, SourceDeviceId = session.DeviceId,
                         Revision = revision.Value, PayloadJson = payload, PayloadHash = payloadHash, ReceivedAtUtc = clock.GetUtcNow() };
                     db.FocusRecords.Add(added);
+                    records.Add(added.RecordId, added);
                     AppendChange(added);
                 }
             }
-            db.FocusSyncReceipts.Add(new() { UserId = userId, OperationId = operation.OperationId, RecordId = operation.RecordId,
-                RequestHash = digest, Status = status.ToString(), Code = code, Revision = revision, ReceivedAtUtc = clock.GetUtcNow() });
+            var savedReceipt = new FocusSyncReceipt { UserId = userId, OperationId = operation.OperationId, RecordId = operation.RecordId,
+                RequestHash = digest, Status = status.ToString(), Code = code, Revision = revision, ReceivedAtUtc = clock.GetUtcNow() };
+            db.FocusSyncReceipts.Add(savedReceipt);
+            receipts.Add(savedReceipt.OperationId, savedReceipt);
             results.Add(new(operation.OperationId, operation.RecordId, status, revision, code));
         }
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
+        var applied = results.Count(result => result.Status == SyncOperationStatus.Applied);
+        if (applied > 0) notifications.Publish(userId, sessionId, SyncChangeSections.Focus);
+        logger.LogDebug("Focus delta push received {Received}, applied {Applied}, deletes {Deletes}.",
+            request.Operations.Count, applied, request.Operations.Count(operation => operation.Kind == SyncOperationKind.Delete));
         return new(results);
     }
 
@@ -117,6 +144,8 @@ public sealed class FocusSyncService(AppDbContext db, TimeProvider clock, AuthSe
     public async Task<SyncChangesResponse> ChangesAsync(Guid userId, Guid sessionId, string? cursor, int limit, CancellationToken ct)
     {
         var page = await ReadPageAsync(userId, sessionId, cursor, limit, false, ct);
+        logger.LogDebug("Focus delta pull returned {Changes} changes (initial: {Initial}, more: {More}).",
+            page.Items.Count, cursor is null, page.HasMore);
         return new(page.Items, page.NextCursor!, page.HasMore);
     }
 

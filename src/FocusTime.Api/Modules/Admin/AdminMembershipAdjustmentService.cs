@@ -23,17 +23,20 @@ public sealed class AdminMembershipAdjustmentService(AppDbContext db, Membership
     private static AuthFault Conflict(string code, string message) => new(409, code, message);
     private static string Serialize<T>(T value) => JsonSerializer.Serialize(value, Json);
     private sealed record Snapshot(List<MembershipGrant> Grants, HashSet<Guid> Gifts, HashSet<Guid> Purchased,
-        AdminEffectiveMembership Current, string Fingerprint);
+        AdminEffectiveMembership Current, string Fingerprint, Guid? TrialGrantId);
 
     private async Task<AppUser> FindUser(Guid id, CancellationToken ct) =>
         await db.Users.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct)
             ?? throw new AuthFault(404, "user_not_found", "User not found.");
 
-    private static AdminEffectiveMembership Effective(IEnumerable<MembershipGrant> grants, DateTimeOffset now)
+    private static AdminEffectiveMembership Effective(IEnumerable<MembershipGrant> grants, DateTimeOffset now, Guid? trialGrantId = null)
     {
         var grant = grants.Where(x => x.RevokedAtUtc == null && x.StartsAtUtc <= now && (x.ExpiresAtUtc == null || x.ExpiresAtUtc > now))
             .OrderByDescending(x => x.Kind == "lifetime").ThenByDescending(x => x.ExpiresAtUtc).ThenBy(x => x.Id).FirstOrDefault();
-        return new(grant is not null, grant?.Kind, grant?.Id, grant?.StartsAtUtc, grant?.ExpiresAtUtc);
+        return new(grant is not null, grant?.Kind, grant?.Id, grant?.StartsAtUtc, grant?.ExpiresAtUtc)
+        {
+            IsTrial = grant is { ExpiresAtUtc: not null } && grant.Id == trialGrantId
+        };
     }
 
     private async Task<Snapshot> ReadSnapshot(Guid id, DateTimeOffset now, CancellationToken ct)
@@ -48,11 +51,14 @@ public sealed class AdminMembershipAdjustmentService(AppDbContext db, Membership
             x.Action == "grant" && x.GrantId != null && ids.Contains(x.GrantId.Value)).Select(x => x.GrantId!.Value).ToArrayAsync(ct)).ToHashSet();
         gifts.ExceptWith(purchased);
         var version = await db.MembershipStates.AsNoTracking().Where(x => x.UserId == id).Select(x => (long?)x.Version).SingleOrDefaultAsync(ct) ?? 0;
-        var current = Effective(grants, now);
-        var fingerprint = AuthSecurity.Hash(Serialize(new { version, current,
+        Guid? trialGrantId = ids.Contains(id) &&
+            await MembershipService.RegistrationTrialAudits(db).AnyAsync(x => x.UserId == id, ct) ? id : null;
+        var current = Effective(grants, now, trialGrantId);
+        // Display metadata does not invalidate confirmations issued before the label was added.
+        var fingerprint = AuthSecurity.Hash(Serialize(new { version, current = current with { IsTrial = false },
             grants = grants.Select(x => new { x.Id, x.Kind, x.StartsAtUtc, x.ExpiresAtUtc }),
             gifts = gifts.Order(), purchased = purchased.Order() }));
-        return new(grants, gifts, purchased, current, fingerprint);
+        return new(grants, gifts, purchased, current, fingerprint, trialGrantId);
     }
 
     public async Task<AdminMembershipAdjustmentContext> Context(Guid userId, CancellationToken ct)
@@ -66,7 +72,7 @@ public sealed class AdminMembershipAdjustmentService(AppDbContext db, Membership
         var message = !user.EmailConfirmed ? "该用户尚未验证邮箱，暂不能调整会员。" : state.Purchased.Count > 0
             ? "包含订单购买权益。撤销不等于退款。" : null;
         var result = new AdminMembershipAdjustmentContext(userId, user.Email!, state.Current,
-            Effective(state.Grants.Where(x => !state.Gifts.Contains(x.Id)), now), canAll ? Effective([], now) : null,
+            Effective(state.Grants.Where(x => !state.Gifts.Contains(x.Id)), now, state.TrialGrantId), canAll ? Effective([], now) : null,
             state.Gifts.Count, protectedCount, user.EmailConfirmed, canAll, message);
         await tx.CommitAsync(ct);
         return result;
@@ -144,7 +150,8 @@ public sealed class AdminMembershipAdjustmentService(AppDbContext db, Membership
                     ? Conflict("no_admin_gifts", "No verified administrator gifts to revoke.")
                     : Conflict("no_active_membership", "User has no revocable membership.");
         }
-        var after = Effective(request.Action == "grant" ? snapshot.Grants.Append(grant!) : snapshot.Grants.Where(x => !targets.Contains(x.Id)), now);
+        var after = Effective(request.Action == "grant" ? snapshot.Grants.Append(grant!) : snapshot.Grants.Where(x => !targets.Contains(x.Id)),
+            now, snapshot.TrialGrantId);
         var receipt = new AdminMembershipAdjustment {
             UserId = userId, OperationId = request.OperationId, ActorUserId = actorId, RequestHash = hash,
             Action = request.Action, Plan = request.Plan, Scope = request.Scope, ReasonCode = request.ReasonCode, Note = request.Note,

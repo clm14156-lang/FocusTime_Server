@@ -10,6 +10,28 @@ namespace FocusTime.Api.Modules.Membership;
 
 public sealed class MembershipService(AppDbContext db, TimeProvider clock)
 {
+    private const string RegistrationTrialActor = "registration-trial";
+    private const string RegistrationTrialReason = "免费体验";
+
+    internal static IQueryable<MembershipAudit> RegistrationTrialAudits(AppDbContext db) =>
+        db.MembershipAudits.AsNoTracking().Where(x => x.Actor == RegistrationTrialActor &&
+            x.Action == "grant" && x.Reason == RegistrationTrialReason &&
+            x.GrantId == x.UserId && x.OperationId == x.UserId);
+
+    internal async Task StageRegistrationTrialAsync(Guid userId, CancellationToken ct)
+    {
+        // One operation per new account. The audit and grant primary keys also enforce uniqueness.
+        var operationId = userId;
+        if (await db.MembershipAudits.AsNoTracking().AnyAsync(x => x.UserId == userId &&
+            x.OperationId == operationId && x.Actor == RegistrationTrialActor, ct)) return;
+
+        var days = await db.RegistrationTrialRules.AsNoTracking().Where(x => x.Id == RegistrationTrialRule.SingletonId)
+            .Select(x => x.DurationDays).SingleAsync(ct);
+        var starts = clock.GetUtcNow();
+        await StageChangeAsync(userId, operationId, "grant", "monthly", starts, starts.AddDays(days),
+            null, RegistrationTrialReason, RegistrationTrialActor, ct);
+    }
+
     public async Task<MembershipResponse> GetAsync(Guid userId, CancellationToken ct = default)
     {
         var now = clock.GetUtcNow();
@@ -21,9 +43,10 @@ public sealed class MembershipService(AppDbContext db, TimeProvider clock)
             .ThenBy(x => x.Id).FirstOrDefaultAsync(ct);
         // Display metadata only: retain the existing effective-grant selection and entitlement rules.
         var isTrial = grant is { ExpiresAtUtc: not null } &&
+            ((grant.Id == userId && await RegistrationTrialAudits(db).AnyAsync(x => x.UserId == userId, ct)) ||
             await db.AdminMembershipAdjustments.AsNoTracking().AnyAsync(x => x.UserId == userId &&
                 x.GrantId == grant.Id && x.State == "applied" && x.Action == "grant" && x.ReasonCode == "trial" &&
-                !db.MembershipOrders.Any(order => order.MembershipGrantId == grant.Id), ct);
+                !db.MembershipOrders.Any(order => order.MembershipGrantId == grant.Id), ct));
         DateTimeOffset? lastExpiredAt = grant is not null ? null : await db.MembershipGrants.AsNoTracking()
             .Where(x => x.UserId == userId && x.RevokedAtUtc == null && x.ExpiresAtUtc <= now)
             .MaxAsync(x => x.ExpiresAtUtc, ct);
@@ -38,11 +61,16 @@ public sealed class MembershipService(AppDbContext db, TimeProvider clock)
         };
     }
 
-    public async Task<UserProfile> ApplyAsync(UserProfile profile, CancellationToken ct)
+    public async Task<UserProfile> ApplyAsync(UserProfile profile, CancellationToken ct, bool includeStatus = false)
     {
         if (!profile.EmailConfirmed) return profile;
         var status = await GetAsync(profile.Id, ct);
-        return profile with { Membership = status.Kind.ToString().ToLowerInvariant(), MembershipVersion = status.Version };
+        return profile with
+        {
+            Membership = status.Kind.ToString().ToLowerInvariant(),
+            MembershipVersion = status.Version,
+            MembershipStatus = includeStatus ? status : null
+        };
     }
 
     public async Task<MembershipAudit> ChangeAsync(Guid userId, Guid operationId, string action, string kind,

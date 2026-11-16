@@ -3,13 +3,16 @@ using FocusTime.Api.Modules.Sessions;
 using FocusTime.Api.Modules.Sessions.Contracts;
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity.Contracts;
+using FocusTime.Api.Modules.Membership;
+using FocusTime.Api.Modules.Admin;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 
 namespace FocusTime.Api.Modules.Identity;
 
 public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, AuthSecurity security,
-    IEmailSender mail, TimeProvider clock, ILogger<AccountService> logger, LoginProtection loginProtection)
+    IEmailSender mail, TimeProvider clock, ILogger<AccountService> logger, LoginProtection loginProtection,
+    MembershipService memberships, AdminAlertSignals alerts, IHttpContextAccessor http)
 {
     // PostgreSQL timestamps have microsecond precision. Milliseconds also make replay responses exact.
     private DateTimeOffset Now => DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds());
@@ -53,7 +56,16 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         // Unknown reset accounts receive the same challenge shape, but no email and no usable ticket.
         if (purpose == "register" || await users.FindByEmailAsync(email) is { ClosedAtUtc: null })
         {
-            try { await mail.SendCodeAsync(email, purpose, code, ct); }
+            try
+            {
+                await mail.SendCodeAsync(email, purpose, code, ct);
+                if (purpose == "register") alerts.RecordRegistrationMail(true);
+            }
+            catch (Exception error) when (purpose == "register" && error is not OperationCanceledException)
+            {
+                alerts.RecordRegistrationMail(false);
+                throw;
+            }
             catch (AuthFault fault) when (purpose == "reset" && fault.Code == "email_unavailable")
             {
                 // Do not reveal account existence through different SMTP failure responses.
@@ -116,9 +128,28 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         var user = await RegisterUserAsync(request, ct);
         var (session, access, refresh) = await CreateSessionAsync(user, device, false, ct);
-        // Account, consumed challenge and login credentials commit together.
+        var response = Response(session, user, access, refresh!);
+        if (request.Source == "website")
+        {
+            try
+            {
+                await memberships.StageRegistrationTrialAsync(user.Id, ct);
+                await db.SaveChangesAsync(ct);
+                response = response with { User = await memberships.ApplyAsync(response.User, ct, includeStatus: true) };
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Could not grant the registration trial for user {UserId}.", user.Id);
+                throw;
+            }
+        }
+        else
+        {
+            response = response with { User = await memberships.ApplyAsync(response.User, ct) };
+        }
+        // The account, consumed challenge, login credentials and registration trial commit together.
         await tx.CommitAsync(ct);
-        return Response(session, user, access, refresh!);
+        return response;
     }
 
     public async Task<TokenResponse> LoginAsync(LoginRequest request, CancellationToken ct)
@@ -200,7 +231,10 @@ public sealed class AccountService(AppDbContext db, UserManager<AppUser> users, 
         async Task<AuthFault> InvalidCredentialsAsync()
         {
             var captcha = attempt is null ? null : await loginProtection.RecordFailureAsync(attempt, request.Device.InstallationId, ct);
-            return await RejectAsync(new AuthFault(401, "invalid_credentials", "Email or password is incorrect.") { Captcha = captcha });
+            var fault = await RejectAsync(new AuthFault(401, "invalid_credentials", "Email or password is incorrect.") { Captcha = captcha });
+            if (http.HttpContext?.Connection.RemoteIpAddress is { } ip)
+                alerts.RecordLoginFailure(security.Derive($"alert-source:{ip}"), security.Derive($"alert-account:{email}"));
+            return fault;
         }
     }
 

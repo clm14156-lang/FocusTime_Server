@@ -15,7 +15,7 @@ public sealed record AdminUserCloudStats(long FocusSeconds, long CompletedTasks,
     long Records, int Rules, int? RemainingTasks, int? TotalTasks, DateTimeOffset? LastSyncAtUtc);
 public sealed record AdminUserAccount(Guid UserId, AdminUserSecurity Security, AdminUserCloudStats Stats);
 public sealed record AdminUserCurrentMembership(Guid GrantId, string Plan, DateTimeOffset StartsAtUtc,
-    DateTimeOffset? ExpiresAtUtc, string? Source, Guid? OrderId, string? OrderNumber);
+    DateTimeOffset? ExpiresAtUtc, string? Source, Guid? OrderId, string? OrderNumber, bool IsTrial = false);
 public sealed record AdminUserMembership(Guid UserId, AdminUserCurrentMembership? Current);
 public sealed record AdminUserSession(Guid Id, Guid DeviceId, string Name, string OperatingSystem,
     string ClientVersion, DateTimeOffset FirstLoginAtUtc, DateTimeOffset LastActiveAtUtc,
@@ -94,11 +94,13 @@ public sealed class AdminUserDetailsController(AppDbContext db, TimeProvider clo
             var order = await db.MembershipOrders.AsNoTracking().Where(x => x.UserId == userId &&
                 x.MembershipGrantId == grant.Id && (x.Status == "paid" || x.Status == "refunding" || x.Status == "refunded") && x.ActivationStatus == "activated")
                 .OrderBy(x => x.ActivatedAtUtc).ThenBy(x => x.Id).FirstOrDefaultAsync(ct);
-            var manual = await db.MembershipAudits.AsNoTracking().AnyAsync(x => x.UserId == userId &&
+            var isTrial = grant.Id == userId && grant.ExpiresAtUtc.HasValue &&
+                await MembershipService.RegistrationTrialAudits(db).AnyAsync(x => x.UserId == userId, ct);
+            var manual = order is null && !isTrial && await db.MembershipAudits.AsNoTracking().AnyAsync(x => x.UserId == userId &&
                 x.GrantId == grant.Id && x.Action == "grant" && x.Actor != "membership-order", ct);
             current = new(grant.Id, grant.Kind, grant.StartsAtUtc, grant.ExpiresAtUtc,
-                order is not null ? "order" : manual ? "manual" : null,
-                order?.Id, order is null ? null : MembershipOrderService.ToResponse(order, now).OrderNumber);
+                isTrial ? "registration-trial" : order is not null ? "order" : manual ? "manual" : null,
+                order?.Id, order is null ? null : MembershipOrderService.ToResponse(order, now).OrderNumber, isTrial);
         }
         await snapshot.CommitAsync(ct);
         return new(userId, current);

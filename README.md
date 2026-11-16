@@ -77,6 +77,16 @@ dotnet run --project src/FocusTime.Api
 
 运行发布后的 DLL 时，将工作目录设为发布目录，确保 appsettings.json 正确加载；Dockerfile 已配置对应 WORKDIR。
 
+查看本地 API 的实时请求和响应状态：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Watch-LocalApiRequests.ps1
+```
+
+窗口默认查看 `5082`，用 `-Port 5080` 查看桌面客户端后端。脚本选择对应端口最近更新的日志，也可用 `-LogPath` 指定文件。它只显示请求时间、方法、路径、状态码、耗时和追踪 ID。用 Ctrl+C 退出查看。
+
+通过独立脚本启动 API 时，给 `Start-LocalApi.ps1` 加 `-ShowRequests` 可打开单独的日志窗口。启动新版开发后端时，这个参数也会逐条记录健康检查和同步请求。使用管理后台的一键启动脚本时，可在启动前在同一终端设置 `$env:RequestTracing__LogAll = 'true'` 来开启逐条记录，再单独运行查看脚本。已经运行的 API 使用启动时的设置。
+
 ## 使用 Docker Compose
 
 ```powershell

@@ -278,6 +278,14 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<string>("AlertKey")
+                        .HasMaxLength(160)
+                        .HasColumnType("character varying(160)");
+
+                    b.Property<string>("AuditId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<string>("Description")
                         .IsRequired()
                         .HasMaxLength(512)
@@ -291,14 +299,26 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
                         .HasMaxLength(16)
                         .HasColumnType("character varying(16)");
 
+                    b.Property<DateTimeOffset?>("LastOccurredAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<Guid?>("MonitorIncidentId")
                         .HasColumnType("uuid");
+
+                    b.Property<int>("OccurrenceCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(1);
 
                     b.Property<DateTimeOffset>("OccurredAtUtc")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<Guid?>("OrderId")
                         .HasColumnType("uuid");
+
+                    b.Property<string>("Resolution")
+                        .HasMaxLength(24)
+                        .HasColumnType("character varying(24)");
 
                     b.Property<string>("Service")
                         .HasMaxLength(16)
@@ -308,6 +328,10 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
 
                     b.HasIndex("HandledAtUtc")
                         .HasFilter("\"HandledAtUtc\" IS NULL");
+
+                    b.HasIndex("AlertKey")
+                        .IsUnique()
+                        .HasFilter("\"AlertKey\" IS NOT NULL AND \"HandledAtUtc\" IS NULL");
 
                     b.HasIndex("MonitorIncidentId")
                         .IsUnique();
@@ -1152,6 +1176,8 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
 
                     b.ToTable("plans", "membership", t =>
                         {
+                            t.HasCheckConstraint("ck_monthly_plan_duration", "\"Id\" <> 'monthly' OR \"DurationDays\" = 30");
+
                             t.HasCheckConstraint("ck_plan_terms", "\"Id\" IN ('monthly', 'annual', 'lifetime') AND \"AmountFen\" BETWEEN 1 AND 100000000 AND \"Version\" > 0 AND ((\"Id\" = 'lifetime' AND \"DurationDays\" IS NULL) OR (\"Id\" <> 'lifetime' AND \"DurationDays\" IS NOT NULL AND \"DurationDays\" BETWEEN 1 AND 36500))");
                         });
                 });
@@ -1167,6 +1193,25 @@ namespace FocusTime.Api.Infrastructure.Persistence.Migrations
                     b.HasKey("UserId");
 
                     b.ToTable("states", "membership");
+                });
+
+            modelBuilder.Entity("FocusTime.Api.Modules.Membership.RegistrationTrialRule", b =>
+                {
+                    b.Property<int>("Id")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DurationDays")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("Version")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("registration_trial_rule", "membership", t =>
+                        {
+                            t.HasCheckConstraint("ck_registration_trial_rule", "\"Id\" = 1 AND \"DurationDays\" BETWEEN 1 AND 15 AND \"Version\" > 0");
+                        });
                 });
 
             modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserClaim<System.Guid>", b =>

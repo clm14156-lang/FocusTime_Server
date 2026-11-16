@@ -17,6 +17,16 @@ using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication;
 using FocusTime.Api.Modules.Membership;
 
+if (args.SequenceEqual(["--alert-watchdog"]))
+{
+    using var stop = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; stop.Cancel(); };
+    var config = new ConfigurationBuilder().AddEnvironmentVariables().Build();
+    try { await new AdminAlertWatchdog(config).RunAsync(stop.Token); }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+    return;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddScoped<MembershipService>();
 builder.Services.AddScoped<MembershipOrderService>();
@@ -131,10 +141,15 @@ builder.Services.AddScoped<SecurityNotificationDispatcher>();
 builder.Services.AddHostedService<SecurityNotificationWorker>();
 builder.Services.AddScoped<DeviceSessionService>();
 builder.Services.AddScoped<FocusSyncService>();
+builder.Services.AddSingleton<SyncNotifications>();
 builder.Services.AddAuthentication(SessionAuthenticationHandler.SchemeName)
     .AddScheme<AuthenticationSchemeOptions, SessionAuthenticationHandler>(SessionAuthenticationHandler.SchemeName, _ => { });
 builder.Services.AddSingleton<AdminAccess>();
 builder.Services.AddSingleton<AdminMonitor>();
+builder.Services.AddSingleton<AdminAlertSignals>();
+builder.Services.AddSingleton<AdminAlertWatchdog>();
+builder.Services.AddSingleton<AdminAlertHeartbeat>();
+builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<AdminNotificationCollector>();
 builder.Services.AddHostedService<AdminMonitorPoller>();
 builder.Services.AddAuthorization();
@@ -142,7 +157,6 @@ builder.Services.AddOptions<AuthorizationOptions>().Configure<AdminAccess>((opti
     options.AddPolicy(AdminAccess.Policy, policy => policy.RequireAuthenticatedUser()
         .RequireAssertion(context => admins.Allows(context.User))));
 builder.Services.AddHealthChecks()
-    .AddCheck("api", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy())
     .AddCheck<DatabaseReadinessCheck>("database", tags: ["ready"]);
 
 var app = builder.Build();
@@ -178,6 +192,7 @@ app.Use(async (context, next) =>
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseWebSockets();
 app.Use(async (context, next) =>
 {
     if (context.Request.ContentLength > ApiLimits.MaximumRequestBytes)
@@ -197,6 +212,12 @@ app.MapHealthChecks("/health/ready", new HealthCheckOptions
 {
     Predicate = registration => registration.Tags.Contains("ready"),
     ResponseWriter = HealthResponseWriter.WriteAsync
+}).DisableRateLimiting().AllowAnonymous();
+app.MapGet("/health/alert-collector", (HttpContext context, AdminAlertHeartbeat heartbeat) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    var healthy = heartbeat.IsFresh;
+    return Results.Json(new { status = healthy ? "healthy" : "unhealthy" }, statusCode: healthy ? 200 : 503);
 }).DisableRateLimiting().AllowAnonymous();
 if (app.Environment.IsDevelopment())
     app.MapOpenApi().DisableRateLimiting();

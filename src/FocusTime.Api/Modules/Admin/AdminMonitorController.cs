@@ -22,7 +22,7 @@ public sealed record MonitorSnapshot(long CheckedAt, long HistoryStartedAt, Moni
     MonitorIncident[] Incidents);
 
 // These records describe health checks observed by this API process, not historical application logs.
-public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider clock)
+public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider clock, AdminAlertWatchdog? watchdog = null)
 {
     private static readonly string[] ServiceIds = ["api", "database"];
     private readonly SemaphoreSlim gate = new(1);
@@ -41,6 +41,11 @@ public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider c
                 registration => ServiceIds.Contains(registration.Name, StringComparer.Ordinal), ct);
             var now = clock.GetUtcNow().ToUnixTimeMilliseconds();
             var checks = ServiceIds.Select(id => ReadService(id, report)).ToArray();
+            var outside = watchdog?.ReadForApi();
+            if (outside is not null && now - outside.CheckedAt.ToUnixTimeMilliseconds() < 100_000 &&
+                outside.Checks.TryGetValue("api", out var api))
+                checks[0] = new("api", api.Healthy ? "healthy" : "unavailable", outside.ApiLatencyMs, null,
+                    "外部探测耗时", api.Healthy ? "外部探测通过。" : "外部探测无法访问 API。");
             foreach (var check in checks)
             {
                 var index = incidents.FindIndex(item => item.Service == check.Id && item.RecoveredAt is null);
@@ -77,7 +82,7 @@ public sealed class AdminMonitor(HealthCheckService healthChecks, TimeProvider c
 }
 
 public sealed class AdminMonitorPoller(AdminMonitor monitor, IServiceScopeFactory scopes,
-    ILogger<AdminMonitorPoller> logger) : BackgroundService
+    ILogger<AdminMonitorPoller> logger, AdminAlertHeartbeat heartbeat) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -91,6 +96,7 @@ public sealed class AdminMonitorPoller(AdminMonitor monitor, IServiceScopeFactor
                 {
                     await using var scope = scopes.CreateAsyncScope();
                     await scope.ServiceProvider.GetRequiredService<AdminNotificationCollector>().ObserveAsync(snapshot, stoppingToken);
+                    heartbeat.Complete();
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }

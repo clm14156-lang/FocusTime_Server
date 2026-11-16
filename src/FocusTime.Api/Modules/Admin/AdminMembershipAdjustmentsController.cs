@@ -12,7 +12,11 @@ public sealed record PreviewAdminMembershipRequest(Guid OperationId, string Acti
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ApplyAdminMembershipRequest(Guid OperationId, bool AcknowledgeNoRefund = false);
 public sealed record AdminEffectiveMembership(bool IsActive, string? Plan, Guid? GrantId,
-    DateTimeOffset? StartsAtUtc, DateTimeOffset? ExpiresAtUtc);
+    DateTimeOffset? StartsAtUtc, DateTimeOffset? ExpiresAtUtc)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsTrial { get; init; }
+}
 public sealed record AdminMembershipAdjustmentContext(Guid UserId, string Email, AdminEffectiveMembership Current,
     AdminEffectiveMembership AfterGiftRevocation, AdminEffectiveMembership? AfterAllRevocation,
     int GiftGrantCount, int ProtectedGrantCount, bool CanGrant, bool CanRevokeAll, string? ProtectionNote);

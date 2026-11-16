@@ -21,11 +21,12 @@ public sealed class AdminAuditQuery
 }
 public sealed record AdminAuditResult(string Status, IReadOnlyList<AdminAuditChange> Changes, string? Reason);
 public sealed record AdminAuditLog(string Id, DateTimeOffset OccurredAtUtc, string Administrator, string Category,
-    string Action, string Target, string TargetId, string Source, string? Ip, AdminAuditResult Result, string? Note);
+    string Action, string Target, string TargetId, string Source, string? Ip, AdminAuditResult Result, string? Note,
+    Guid? MembershipGrantId = null);
 public sealed record AdminAuditPage(IReadOnlyList<AdminAuditLog> Items, int Total, int Page, int PageSize, DateTimeOffset ServerTimeUtc);
 public sealed record AdminAuditRow(string Id, DateTimeOffset OccurredAtUtc, string Administrator, string Category,
     string Action, string Target, string TargetId, string Source, string? Ip, string Status, string? FailureCode,
-    string ChangesJson, string? BeforeJson, string? AfterJson, string? Note);
+    string ChangesJson, string? BeforeJson, string? AfterJson, string? Note, Guid? MembershipGrantId);
 
 [ApiController, Authorize(Policy = AdminAccess.Policy), Route("api/v1/admin/audit-logs"),
     ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
@@ -36,12 +37,12 @@ public sealed class AdminAuditController(AppDbContext db, TimeProvider clock) : 
     private IQueryable<AdminAuditRow> Records() => db.Database.SqlQueryRaw<AdminAuditRow>("""
         SELECT 'operation:' || a."Id"::text AS "Id", a."OccurredAtUtc", a."Administrator", a."Category", a."Action",
             a."Target", a."TargetId", a."Source", a."Ip", a."Status", a."FailureCode", a."ChangesJson"::text,
-            NULL::text AS "BeforeJson", NULL::text AS "AfterJson", NULL::text AS "Note"
+            NULL::text AS "BeforeJson", NULL::text AS "AfterJson", NULL::text AS "Note", NULL::uuid AS "MembershipGrantId"
         FROM admin.operation_logs a
         UNION ALL
         SELECT 'security:' || a."Id"::text, a."OccurredAtUtc", COALESCE(u."Email", a."ActorUserId"::text),
             'settings', '修改管理员密码', COALESCE(u."Email", a."ActorUserId"::text), a."ActorUserId"::text,
-            '后台 · 账号安全', NULL::varchar, a."Result", a."FailureCode", '[]', NULL, NULL, NULL
+            '后台 · 账号安全', NULL::varchar, a."Result", a."FailureCode", '[]', NULL, NULL, NULL, NULL
         FROM identity.admin_security_audit a LEFT JOIN identity.users u ON u."Id" = a."ActorUserId"
         WHERE a."Operation" = 'admin.password.change'
         UNION ALL
@@ -52,7 +53,8 @@ public sealed class AdminAuditController(AppDbContext db, TimeProvider clock) : 
             '[]', a."BeforeJson"::text, a."AfterJson"::text,
             CASE a."ReasonCode" WHEN 'compensation' THEN '用户补偿' WHEN 'promotion' THEN '活动赠送' WHEN 'trial' THEN '免费体验'
                 WHEN 'internal-test' THEN '内部测试' WHEN 'issued-in-error' THEN '发放错误' WHEN 'ineligible' THEN '赠送资格不符'
-                WHEN 'test-ended' THEN '内部测试结束' WHEN 'refund-request' THEN '用户申请退款' ELSE '其他原因' END || COALESCE('：' || a."Note", '')
+                WHEN 'test-ended' THEN '内部测试结束' WHEN 'refund-request' THEN '用户申请退款' ELSE '其他原因' END || COALESCE('：' || a."Note", ''),
+            a."GrantId"
         FROM membership.admin_adjustments a LEFT JOIN identity.users actor ON actor."Id" = a."ActorUserId"
             LEFT JOIN identity.users target ON target."Id" = a."UserId"
         WHERE a."State" = 'applied' AND a."AppliedAtUtc" IS NOT NULL
@@ -60,7 +62,7 @@ public sealed class AdminAuditController(AppDbContext db, TimeProvider clock) : 
         SELECT 'membership:' || a."OperationId"::text, a."CreatedAtUtc", COALESCE(actor."Email", a."Actor"),
             'users', CASE WHEN a."Action" = 'grant' THEN '人工发放会员' ELSE '人工撤销会员' END,
             COALESCE(target."Email", a."UserId"::text), a."UserId"::text, '管理工具 · 会员管理', NULL, 'success', NULL,
-            '[]', NULL, NULL, a."Reason"
+            '[]', NULL, NULL, a."Reason", a."GrantId"
         FROM membership.audit a LEFT JOIN identity.users target ON target."Id" = a."UserId"
             LEFT JOIN identity.users actor ON a."Actor" = 'admin:' || actor."Id"::text OR a."Actor" = actor."Id"::text
         WHERE a."Actor" <> 'membership-order' AND a."Actor" NOT LIKE 'admin-adjustment:%' AND a."Actor" NOT LIKE 'admin-refund:%'
@@ -70,7 +72,8 @@ public sealed class AdminAuditController(AppDbContext db, TimeProvider clock) : 
             'FT' || upper(replace(o."Id"::text, '-', '')), o."Id"::text, '后台 · 订单管理', NULL,
             CASE WHEN e."Kind" = 'membership_activated' THEN 'success' ELSE 'failure' END,
             CASE WHEN e."Kind" = 'membership_activation_failed' THEN 'membership_activation_failed' ELSE NULL END,
-            '[]', NULL, NULL, target."Email"
+            '[]', NULL, NULL, target."Email",
+            CASE WHEN e."Kind" = 'membership_activated' THEN o."MembershipGrantId" ELSE NULL END
         FROM membership.order_events e JOIN membership.orders o ON o."Id" = e."OrderId"
             LEFT JOIN identity.users actor ON e."Actor" = 'admin:' || actor."Id"::text
             LEFT JOIN identity.users target ON target."Id" = o."UserId"
@@ -122,14 +125,16 @@ public sealed class AdminAuditController(AppDbContext db, TimeProvider clock) : 
         {
             var before = JsonSerializer.Deserialize<AdminEffectiveMembership>(row.BeforeJson, Json)!;
             var after = JsonSerializer.Deserialize<AdminEffectiveMembership>(row.AfterJson, Json)!;
-            static string Plan(AdminEffectiveMembership value) => !value.IsActive ? "非会员" : value.Plan switch { "monthly" => "月会员", "annual" => "年会员", "lifetime" => "永久会员", _ => "会员" };
+            static string Plan(AdminEffectiveMembership value) => !value.IsActive ? "非会员" : value.IsTrial ? "体验会员"
+                : value.Plan switch { "monthly" => "月会员", "annual" => "年会员", "lifetime" => "永久会员", _ => "会员" };
             static string? Time(DateTimeOffset? value) => value?.ToOffset(TimeSpan.FromHours(8)).ToString("yyyy-MM-dd HH:mm:ss");
             changes = [new("当前会员", Plan(before), Plan(after)), new("会员有效期至", Time(before.ExpiresAtUtc), Time(after.ExpiresAtUtc)),
                 new("会员授权编号", before.GrantId?.ToString(), after.GrantId?.ToString())];
             changes = changes.Where(x => x.Before != x.After).ToArray();
         }
         return new(row.Id, row.OccurredAtUtc, row.Administrator, row.Category, row.Action, row.Target, row.TargetId,
-            row.Source, row.Ip, new(row.Status, changes, row.Status == "failure" ? FailureReason(row.FailureCode) : null), row.Note);
+            row.Source, row.Ip, new(row.Status, changes, row.Status == "failure" ? FailureReason(row.FailureCode) : null),
+            row.Note, row.MembershipGrantId);
     }
 
     private static string FailureReason(string? code) => code switch {

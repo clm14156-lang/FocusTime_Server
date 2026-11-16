@@ -38,12 +38,16 @@ public sealed class SessionAuthenticationHandler(IOptionsMonitor<AuthenticationS
         if (session is null) return AuthenticateResult.Fail("Invalid or expired session.");
         // Throttle activity writes; a concurrent revocation can never be overwritten here.
         var seen = DateTimeOffset.FromUnixTimeMilliseconds(now.ToUnixTimeMilliseconds());
-        var touched = await db.LoginSessions.Where(x => x.Id == session.Id && x.AccessHash == hash && x.RevokedAtUtc == null &&
-            x.LastSeenAtUtc < seen.AddMinutes(-1))
-            .ExecuteUpdateAsync(set => set.SetProperty(x => x.LastSeenAtUtc, seen), Context.RequestAborted);
-        if (touched > 0)
-            await db.LoginDevices.Where(x => x.Id == session.DeviceId && x.LastSeenAtUtc < seen)
+        var lastSeenCutoff = seen.AddMinutes(-1);
+        if (session.LastSeenAtUtc < lastSeenCutoff)
+        {
+            var touched = await db.LoginSessions.Where(x => x.Id == session.Id && x.AccessHash == hash && x.RevokedAtUtc == null &&
+                x.LastSeenAtUtc < lastSeenCutoff)
                 .ExecuteUpdateAsync(set => set.SetProperty(x => x.LastSeenAtUtc, seen), Context.RequestAborted);
+            if (touched > 0)
+                await db.LoginDevices.Where(x => x.Id == session.DeviceId && x.LastSeenAtUtc < seen)
+                    .ExecuteUpdateAsync(set => set.SetProperty(x => x.LastSeenAtUtc, seen), Context.RequestAborted);
+        }
         var identity = new ClaimsIdentity([
             new Claim(ClaimTypes.NameIdentifier, session.UserId.ToString()),
             new Claim("sid", session.Id.ToString())], SchemeName);

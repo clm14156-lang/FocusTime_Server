@@ -10,6 +10,17 @@ namespace FocusTime.Api.Modules.Admin;
 public sealed class AdminAuditWriter(AppDbContext db, TimeProvider clock)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    public async Task StageTrialRuleChange(HttpContext context, int before, int after, CancellationToken ct)
+    {
+        var actor = Guid.Parse(context.User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        var email = await db.Users.Where(x => x.Id == actor).Select(x => x.Email).SingleAsync(ct);
+        var change = new AdminAuditChange("体验时长", $"{before} 天", $"{after} 天");
+        db.AdminOperationLogs.Add(new() { ActorUserId = actor, Administrator = email ?? actor.ToString(),
+            OccurredAtUtc = clock.GetUtcNow(), Category = "plans", Action = "修改体验规则", TargetId = "registration-trial",
+            Target = "免费体验规则", Source = "后台 · 套餐管理", Ip = context.Connection.RemoteIpAddress?.ToString(),
+            Status = "success", ChangesJson = JsonSerializer.Serialize(new[] { change }, Json) });
+    }
+
     public async Task StagePlanChange(HttpContext context, MembershipPlanResponse before, MembershipPlan after, CancellationToken ct)
     {
         var actor = Guid.Parse(context.User.FindFirstValue(ClaimTypes.NameIdentifier)!);

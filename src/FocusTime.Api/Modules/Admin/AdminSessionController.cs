@@ -104,7 +104,9 @@ public sealed class AdminSessionController(AccountService accounts, AdminAccess 
             .ExecuteUpdateAsync(set => set.SetProperty(x => x.Consumed, true).SetProperty(x => x.TicketConsumed, true), ct);
         await db.LoginSessions.Where(x => x.UserId == user.Id && x.RevokedAtUtc == null)
             .ExecuteUpdateAsync(set => set.SetProperty(x => x.RevokedAtUtc, now), ct);
-        db.AdminSecurityAudits.Add(new() { ActorUserId = user.Id, OccurredAtUtc = now, Result = "success" });
+        var audit = new AdminSecurityAudit { ActorUserId = user.Id, OccurredAtUtc = now, Result = "success" };
+        db.AdminSecurityAudits.Add(audit);
+        AdminNotificationCollector.StageAudit(db, $"security:{audit.Id}", "管理员密码已变更。", now);
         // Failure to persist the audit rolls back both the password and session changes.
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);

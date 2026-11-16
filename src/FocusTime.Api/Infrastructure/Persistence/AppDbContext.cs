@@ -32,6 +32,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
     public DbSet<MembershipOrderEvent> MembershipOrderEvents => Set<MembershipOrderEvent>();
     public DbSet<MembershipOrderRefund> MembershipOrderRefunds => Set<MembershipOrderRefund>();
     public DbSet<MembershipPlan> MembershipPlans => Set<MembershipPlan>();
+    public DbSet<RegistrationTrialRule> RegistrationTrialRules => Set<RegistrationTrialRule>();
 
     public DbSet<AdminSecurityAudit> AdminSecurityAudits => Set<AdminSecurityAudit>();
     public DbSet<AdminOperationLog> AdminOperationLogs => Set<AdminOperationLog>();
@@ -50,6 +51,11 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
             entity.Property(x => x.Kind).HasMaxLength(16);
             entity.Property(x => x.Service).HasMaxLength(16);
             entity.Property(x => x.Description).HasMaxLength(512);
+            entity.Property(x => x.AlertKey).HasMaxLength(160);
+            entity.Property(x => x.Resolution).HasMaxLength(24);
+            entity.Property(x => x.AuditId).HasMaxLength(64);
+            entity.Property(x => x.OccurrenceCount).HasDefaultValue(1);
+            entity.HasIndex(x => x.AlertKey).IsUnique().HasFilter("\"AlertKey\" IS NOT NULL AND \"HandledAtUtc\" IS NULL");
             entity.HasIndex(x => new { x.OccurredAtUtc, x.Id });
             entity.HasIndex(x => x.MonitorIncidentId).IsUnique();
             entity.HasIndex(x => x.HandledAtUtc).HasFilter("\"HandledAtUtc\" IS NULL");
@@ -101,12 +107,23 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
         });
         builder.Entity<MembershipPlan>(entity =>
         {
-            entity.ToTable("plans", "membership", table => table.HasCheckConstraint("ck_plan_terms",
-                "\"Id\" IN ('monthly', 'annual', 'lifetime') AND \"AmountFen\" BETWEEN 1 AND 100000000 AND \"Version\" > 0 AND ((\"Id\" = 'lifetime' AND \"DurationDays\" IS NULL) OR (\"Id\" <> 'lifetime' AND \"DurationDays\" IS NOT NULL AND \"DurationDays\" BETWEEN 1 AND 36500))"));
+            entity.ToTable("plans", "membership", table =>
+            {
+                table.HasCheckConstraint("ck_plan_terms",
+                    "\"Id\" IN ('monthly', 'annual', 'lifetime') AND \"AmountFen\" BETWEEN 1 AND 100000000 AND \"Version\" > 0 AND ((\"Id\" = 'lifetime' AND \"DurationDays\" IS NULL) OR (\"Id\" <> 'lifetime' AND \"DurationDays\" IS NOT NULL AND \"DurationDays\" BETWEEN 1 AND 36500))");
+                table.HasCheckConstraint("ck_monthly_plan_duration", $"\"Id\" <> 'monthly' OR \"DurationDays\" = {MembershipPlan.MonthlyDurationDays}");
+            });
             entity.HasKey(x => x.Id);
             entity.Property(x => x.Id).HasMaxLength(16);
             entity.Property(x => x.Name).HasMaxLength(64);
             entity.HasOne<AppUser>().WithMany().HasForeignKey(x => x.UpdatedByUserId).OnDelete(DeleteBehavior.Restrict);
+        });
+        builder.Entity<RegistrationTrialRule>(entity =>
+        {
+            entity.ToTable("registration_trial_rule", "membership", table => table.HasCheckConstraint(
+                "ck_registration_trial_rule", $"\"Id\" = {RegistrationTrialRule.SingletonId} AND \"DurationDays\" BETWEEN {RegistrationTrialRule.MinimumDays} AND {RegistrationTrialRule.MaximumDays} AND \"Version\" > 0"));
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedNever();
         });
         builder.Entity<AdminSecurityAudit>(entity =>
         {

@@ -103,6 +103,8 @@ public sealed class AdminUserActionsController(AppDbContext db, AdminAccess admi
             OccurredAtUtc = now, Category = "users", Action = action, TargetId = targetId, Target = user.Email!,
             Source = "后台 · 用户管理", Ip = HttpContext.Connection.RemoteIpAddress?.ToString(), Status = "success",
             ChangesJson = JsonSerializer.Serialize(changes, Json) });
+        if (action == DisableAction && !disabled)
+            AdminNotificationCollector.StageAudit(db, $"operation:{operationId}", "管理员已禁用用户账号。", now);
         try { await db.SaveChangesAsync(ct); }
         catch (DbUpdateException error) when (error.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
         { throw OperationConflict(); }

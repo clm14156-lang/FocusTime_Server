@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 using System.Data;
 using FocusTime.Api.Infrastructure.Persistence;
 using FocusTime.Api.Modules.Identity;
+using FocusTime.Api.Modules.Membership;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -27,6 +28,7 @@ public sealed record AdminUser
     public DateTimeOffset RegisteredAtUtc { get; init; }
     public DateTimeOffset? LastLoginAtUtc { get; init; }
     public string? MembershipPlan { get; init; }
+    public bool MembershipIsTrial { get; init; }
     public DateTimeOffset? MembershipStartsAtUtc { get; init; }
     public DateTimeOffset? MembershipExpiresAtUtc { get; init; }
     public DateTimeOffset? LockedUntilUtc { get; init; }
@@ -89,8 +91,10 @@ public sealed class AdminUsersController(AppDbContext db, TimeProvider clock) : 
         await Rows(clock.GetUtcNow()).SingleOrDefaultAsync(x => x.Id == id, ct)
             ?? throw new AuthFault(404, "user_not_found", "User not found.");
 
-    private IQueryable<AdminUser> Rows(DateTimeOffset now) =>
-        from user in db.Users.AsNoTracking()
+    private IQueryable<AdminUser> Rows(DateTimeOffset now)
+    {
+        var trials = MembershipService.RegistrationTrialAudits(db);
+        return from user in db.Users.AsNoTracking()
         from grant in db.MembershipGrants.AsNoTracking().Where(g => g.UserId == user.Id && g.RevokedAtUtc == null &&
                 g.StartsAtUtc <= now && (g.ExpiresAtUtc == null || g.ExpiresAtUtc > now))
             .OrderByDescending(g => g.Kind == "lifetime").ThenByDescending(g => g.ExpiresAtUtc).ThenBy(g => g.Id)
@@ -101,6 +105,9 @@ public sealed class AdminUsersController(AppDbContext db, TimeProvider clock) : 
             RegisteredAtUtc = user.CreatedAtUtc,
             LastLoginAtUtc = db.LoginSessions.Where(s => s.UserId == user.Id).Max(s => (DateTimeOffset?)s.CreatedAtUtc),
             MembershipPlan = grant == null ? null : grant.Kind, MembershipStartsAtUtc = grant == null ? null : grant.StartsAtUtc,
+            MembershipIsTrial = grant != null && grant.Id == user.Id && grant.ExpiresAtUtc != null &&
+                trials.Any(x => x.UserId == user.Id),
             MembershipExpiresAtUtc = grant == null ? null : grant.ExpiresAtUtc,
             LockedUntilUtc = user.LockoutEnabled && user.LockoutEnd > now && user.LockoutEnd != DateTimeOffset.MaxValue ? user.LockoutEnd : null };
+    }
 }
