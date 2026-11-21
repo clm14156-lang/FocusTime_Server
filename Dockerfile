@@ -9,7 +9,7 @@ RUN dotnet publish src/FocusTime.Api/FocusTime.Api.csproj -c Release --no-restor
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
 WORKDIR /app
 COPY --from=build /app/publish/ ./
-RUN mkdir -p /app/.artifacts/mail && chown -R app:app /app/.artifacts && chmod 700 /app/.artifacts
+RUN chmod -R a+rX /app && mkdir -p /app/.artifacts/mail && chown -R app:app /app/.artifacts && chmod 700 /app/.artifacts
 ENV ASPNETCORE_HTTP_PORTS=8080
 USER app
 EXPOSE 8080
