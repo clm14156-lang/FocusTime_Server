@@ -135,7 +135,12 @@ public sealed class FocusBidirectionalTests
         await using var database = await TestDatabase.CreateAsync(); await using var db = database.CreateContext();
         await db.GetService<IMigrator>().MigrateAsync("20261103042017_FocusRecordUpload");
         var user = new AppUser { Email = "legacy@example.test", NormalizedEmail = "LEGACY@EXAMPLE.TEST", UserName = "legacy@example.test", NormalizedUserName = "LEGACY@EXAMPLE.TEST" };
-        db.Users.Add(user); var id = Guid.NewGuid(); var payload = JsonSerializer.Serialize(Record(), FocusPayloadCodec.Json);
+        // This fixture targets the historical schema, before account security columns existed.
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO identity.users ("Id","CreatedAtUtc","UserName","NormalizedUserName","Email","NormalizedEmail","EmailConfirmed","PhoneNumberConfirmed","TwoFactorEnabled","LockoutEnabled","AccessFailedCount")
+            VALUES ({user.Id},{user.CreatedAtUtc},{user.UserName},{user.NormalizedUserName},{user.Email},{user.NormalizedEmail},false,false,false,false,0)
+            """);
+        var id = Guid.NewGuid(); var payload = JsonSerializer.Serialize(Record(), FocusPayloadCodec.Json);
         db.FocusRecords.Add(new() { UserId = user.Id, RecordId = id, SourceDeviceId = Guid.NewGuid(), Revision = 7, PayloadJson = payload, PayloadHash = AuthSecurity.Hash(payload), ReceivedAtUtc = DateTimeOffset.UtcNow });
         db.FocusSyncStates.Add(new() { UserId = user.Id, LastRevision = 7 }); await db.SaveChangesAsync();
         await db.Database.MigrateAsync(); var backfilled = await db.FocusChanges.SingleAsync();

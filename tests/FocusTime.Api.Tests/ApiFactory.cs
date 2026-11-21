@@ -12,6 +12,7 @@ namespace FocusTime.Api.Tests;
 public sealed class ApiFactory(string? database = null, int permitLimit = 120, string environment = "Development")
     : WebApplicationFactory<Program>
 {
+    private static readonly string MembershipKey = System.Security.Cryptography.RSA.Create(2048).ExportPkcs8PrivateKeyPem();
     public TestMail Mail { get; } = new();
     public TestClock Clock { get; } = new();
     public string? Secret { get; init; } = Convert.ToBase64String(new byte[32]);
@@ -23,7 +24,8 @@ public sealed class ApiFactory(string? database = null, int permitLimit = 120, s
             {
                 ["RateLimiting:PermitLimit"] = permitLimit.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["RateLimiting:WindowSeconds"] = "60",
-                ["Authentication:Secret"] = Secret
+                ["Authentication:Secret"] = Secret,
+                ["Membership:SigningKeyPem"] = MembershipKey
             }));
         builder.ConfigureLogging(logging => logging.ClearProviders());
         builder.ConfigureServices(services =>
@@ -54,6 +56,12 @@ public sealed class TestMail : IEmailSender
         if (Fail) throw new AuthFault(503, "email_unavailable", "Email delivery failed.");
         Codes[email.ToUpperInvariant() + ":" + purpose] = code;
         return Task.CompletedTask;
+    }
+    public System.Collections.Concurrent.ConcurrentQueue<string> Notices { get; } = new();
+    public Task SendSecurityNoticeAsync(string email, string subject, string body, CancellationToken cancellationToken)
+    {
+        if (Fail) throw new AuthFault(503, "email_unavailable", "Email delivery failed.");
+        Notices.Enqueue(email + ":" + subject); return Task.CompletedTask;
     }
     public string Code(string email, string purpose = "register") => Codes[email.ToUpperInvariant() + ":" + purpose];
 }

@@ -8,6 +8,31 @@ namespace FocusTime.Api.Tests;
 
 public sealed class HttpPipelineTests
 {
+    [Theory]
+    [InlineData("Development", "http://127.0.0.1:5175", true)]
+    [InlineData("Development", "https://unlisted.example", false)]
+    [InlineData("Production", "http://127.0.0.1:5175", false)]
+    public async Task AuthCors_OnlyAllowsConfiguredWebsiteOrigins(string environment, string origin, bool allowed)
+    {
+        await using var factory = new ApiFactory(environment: environment);
+        using var client = factory.CreateClient();
+        using var preflight = new HttpRequestMessage(HttpMethod.Options, "/api/v1/auth/registration-code");
+        preflight.Headers.Add("Origin", origin);
+        preflight.Headers.Add("Access-Control-Request-Method", "POST");
+        preflight.Headers.Add("Access-Control-Request-Headers", "content-type");
+        using var response = await client.SendAsync(preflight);
+        Assert.Equal(allowed, response.Headers.TryGetValues("Access-Control-Allow-Origin", out var origins));
+        if (allowed) Assert.Equal(origin, Assert.Single(origins!));
+
+        using var invalid = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/registration-code");
+        invalid.Headers.Add("Origin", origin);
+        invalid.Content = JsonContent.Create(new { email = "invalid" });
+        using var invalidResponse = await client.SendAsync(invalid);
+        Assert.Equal(HttpStatusCode.BadRequest, invalidResponse.StatusCode);
+        Assert.Equal(allowed, invalidResponse.Headers.Contains("Access-Control-Allow-Origin"));
+        if (allowed) Assert.Contains("Retry-After", invalidResponse.Headers.GetValues("Access-Control-Expose-Headers"));
+    }
+
     [Fact]
     public async Task ServiceInfo_AndLiveness_WorkWithoutDatabase()
     {

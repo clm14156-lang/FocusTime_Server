@@ -4,7 +4,8 @@ param(
     [string]$ArtifactsDirectory = '.artifacts/client-stage2-build',
     [string]$TestFilter = 'FullyQualifiedName~CloudAccountLiveTests',
     [int]$ExpectedPassed = 1,
-    [string]$ServerApiDll
+    [string]$ServerApiDll,
+    [ValidateSet('Debug','Release')][string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -26,8 +27,8 @@ $apiPort = Get-FreePort
 $password = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
 [IO.File]::WriteAllText($pwFile, $password)
 $saved = @{}
-foreach($name in @('DOTNET_ROOT','ConnectionStrings__Database','ASPNETCORE_ENVIRONMENT','Email__PickupDirectory',
-    'FOCUSTIME_TEST_API','FOCUSTIME_TEST_MAIL')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+foreach($name in @('DOTNET_ROOT','ConnectionStrings__Database','ASPNETCORE_ENVIRONMENT','Email__PickupDirectory','Email__Mode',
+    'FOCUSTIME_TEST_API','FOCUSTIME_TEST_MAIL','FOCUSTIME_TEST_SERVER_DLL','FOCUSTIME_TEST_SERVER_DOTNET','FOCUSTIME_TEST_SERVER_ROOT')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
 $started = $false
 $api = $null
 try {
@@ -41,9 +42,13 @@ try {
     $env:ConnectionStrings__Database = "Host=127.0.0.1;Port=$databasePort;Database=postgres;Username=postgres;Password=$password"
     $env:ASPNETCORE_ENVIRONMENT = 'Development'
     $env:Email__PickupDirectory = $mail
-    & $serverDotnet $apiDll --migrate --contentRoot "$projectRoot/src/FocusTime.Api" *> "$testRoot/migrate.log"
+    $env:Email__Mode = 'Pickup'
+    & $serverDotnet $apiDll --migrate --contentRoot $testRoot *> "$testRoot/migrate.log"
     if($LASTEXITCODE -ne 0){throw 'API migration failed. See the isolated migration log.'}
-    $api = Start-Process -FilePath $serverDotnet -ArgumentList @($apiDll,'--contentRoot',"$projectRoot/src/FocusTime.Api",'--urls',"http://127.0.0.1:$apiPort") -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot/api.log" -RedirectStandardError "$testRoot/api-error.log"
+    $api = Start-Process -FilePath $serverDotnet -ArgumentList @($apiDll,'--contentRoot',$testRoot,'--urls',"http://127.0.0.1:$apiPort") -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot/api.log" -RedirectStandardError "$testRoot/api-error.log"
+    $env:FOCUSTIME_TEST_SERVER_DLL = $apiDll
+    $env:FOCUSTIME_TEST_SERVER_DOTNET = $serverDotnet
+    $env:FOCUSTIME_TEST_SERVER_ROOT = $testRoot
     $env:FOCUSTIME_TEST_API = "http://127.0.0.1:$apiPort/"
     $env:FOCUSTIME_TEST_MAIL = $mail
     $ready = $false
@@ -55,7 +60,7 @@ try {
     $env:DOTNET_ROOT = [IO.Path]::GetDirectoryName($ClientDotnetPath)
     Push-Location $clientRoot
     try {
-        & $ClientDotnetPath test tests/FocusApp.Tests/FocusApp.Tests.csproj --no-build --no-restore --artifacts-path (Join-Path $projectRoot $ArtifactsDirectory) --filter $TestFilter --logger 'trx;LogFileName=client-live.trx' --results-directory "$testRoot/results"
+        & $ClientDotnetPath test tests/FocusApp.Tests/FocusApp.Tests.csproj -c $Configuration --no-build --no-restore --artifacts-path (Join-Path $projectRoot $ArtifactsDirectory) --filter $TestFilter --logger 'trx;LogFileName=client-live.trx' --results-directory "$testRoot/results"
         if($LASTEXITCODE -ne 0){throw 'Real API/client account validation failed.'}
     } finally { Pop-Location }
     [xml]$trx = Get-Content -LiteralPath "$testRoot/results/client-live.trx"

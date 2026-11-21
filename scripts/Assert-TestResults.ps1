@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$ResultsDirectory,
-    [int]$MinimumTests = 48,
-    [int]$MinimumPostgresTests = 33
+    [int]$MinimumTests = 63,
+    [int]$MinimumPostgresTests = 43
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +27,8 @@ foreach ($file in $files) {
             $result.testName.StartsWith('FocusTime.Api.Tests.AccountTests.', [StringComparison]::Ordinal) -or
             $result.testName.StartsWith('FocusTime.Api.Tests.DeviceSessionTests.', [StringComparison]::Ordinal) -or
             $result.testName.StartsWith('FocusTime.Api.Tests.FocusSyncTests.', [StringComparison]::Ordinal) -or
-            $result.testName.StartsWith('FocusTime.Api.Tests.FocusBidirectionalTests.', [StringComparison]::Ordinal)) -and
+            $result.testName.StartsWith('FocusTime.Api.Tests.FocusBidirectionalTests.', [StringComparison]::Ordinal) -or
+            $result.testName.StartsWith('FocusTime.Api.Tests.MembershipTests.', [StringComparison]::Ordinal)) -and
             $result.outcome -eq 'Passed') {
             $databasePassed++
         }

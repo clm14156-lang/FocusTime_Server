@@ -190,7 +190,12 @@ public sealed class DeviceSessionTests
         var user = new AppUser { Email = Email, NormalizedEmail = Email.ToUpperInvariant(), UserName = Email };
         var device = new LoginDevice { UserId = user.Id, InstallationId = Guid.NewGuid(), CreatedAtUtc = DateTimeOffset.UtcNow,
             LastSeenAtUtc = DateTimeOffset.UtcNow };
-        db.Add(user); db.Add(device); await db.SaveChangesAsync();
+        // Seed the historical schema without today's additional AppUser columns.
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO identity.users ("Id","CreatedAtUtc","UserName","Email","NormalizedEmail","EmailConfirmed","PhoneNumberConfirmed","TwoFactorEnabled","LockoutEnabled","AccessFailedCount")
+            VALUES ({user.Id},{user.CreatedAtUtc},{user.UserName},{user.Email},{user.NormalizedEmail},false,false,false,false,0)
+            """);
+        db.Add(device); await db.SaveChangesAsync();
         var id = Guid.NewGuid(); var created = DateTimeOffset.FromUnixTimeSeconds(1_700_000_000);
         await db.Database.ExecuteSqlInterpolatedAsync($"""
             INSERT INTO identity.sessions ("Id","UserId","DeviceId","SecurityStamp","AccessHash","AccessExpiresAtUtc","CreatedAtUtc","ExpiresAtUtc")

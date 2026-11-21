@@ -177,7 +177,11 @@ public sealed class AccountTests
         Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync("/api/v1/auth/register",
             new RegisterRequest(Email, challenge.ChallengeId, factory.Mail.Code(Email), Password))).StatusCode);
         for (var i = 0; i < 5; i++)
+        {
+            // Keep this test focused on the Identity lockout across CAPTCHA observation windows.
+            if (i == 3) factory.Clock.Advance(TimeSpan.FromMinutes(16));
             Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/v1/auth/login", Login("wrong"))).StatusCode);
+        }
         Assert.Equal(HttpStatusCode.TooManyRequests, (await client.PostAsJsonAsync("/api/v1/auth/login", Login())).StatusCode);
     }
 
